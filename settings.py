@@ -1,3 +1,4 @@
-RWC_DATASET_PATH = r'E:\Dataset\RWC'
-NOTTINGHAM_DATASET_PATH = r'E:\workplace\nottingham-dataset'
-LA_DATASET_PATH = r'E:\Dataset\Los-Angeles-MIDI-Dataset-Ver-3-0-CC-BY-NC-SA'
+RWC_DATASET_PATH = './Dataset/RWC'
+NOTTINGHAM_DATASET_PATH = './Dataset/nottingham-dataset'
+LA_DATASET_PATH = './Dataset/Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA'
+
