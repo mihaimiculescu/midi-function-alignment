@@ -1,3 +1,4 @@
+# Work in progress - do not use yet!
 # Versatile Symbolic Music-for-Music Modeling via Function Alignment
 
 ## [\[Demo Page\]](https://music-x-lab.github.io/midi-function-alignment-demo/) [\[Paper\]](https://arxiv.org/abs/2506.15548) [\[Pretrained Models\]](https://drive.google.com/drive/folders/1E_gzGgc4Pzd-jpMxOaLEewuvZ35l3jeU?usp=sharing)  [\[Uncurated Demos\]](https://github.com/music-x-lab/midi-function-alignment/tree/main/uncurated_demos)

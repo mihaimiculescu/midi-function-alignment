@@ -81,8 +81,14 @@ class RoFormerSymbolicTransformer(L.LightningModule):
         self.with_velocity = with_velocity
         self.max_lr = max_lr
 
-    def get_base_model(self, config):
-        return RoFormerEncoder(config)
+    # #ORIGINAL
+    # def get_base_model(self, config):
+    #     return RoFormerEncoder(config)
+    #NEW APPARENTLY IT WORKS FOR THE NEWER PEFT 0.20.0
+    def get_base_model(self, config=None):
+        if config is None:
+            return self.model
+        return RoFormerEncoder(config)    
 
     def local_encode(self, x):
         batch_size, seq_len, subseq_len = x.shape

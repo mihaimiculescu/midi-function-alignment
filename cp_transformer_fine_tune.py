@@ -17,7 +17,13 @@ class RoFormerSymbolicTransformerInjected(RoFormerSymbolicTransformer):
     def __init__(self, size=1, max_position_embeddings=512):
         super().__init__(size=size, max_position_embeddings=max_position_embeddings)
 
-    def get_base_model(self, config):
+    # #ORIGINAL
+    # def get_base_model(self, config):
+    #     return RoFormerEncoderInject(config)
+    #NEW APPARENTLY IT WORKS FOR THE NEWER PEFT 0.20.0
+    def get_base_model(self, config=None):
+        if config is None:
+            return self.model
         return RoFormerEncoderInject(config)
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
