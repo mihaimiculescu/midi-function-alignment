@@ -188,8 +188,8 @@ def eval_model(model_name):
         if is_chord_to_mel:
             cond_continuation(model, 'input/ashover19_pitch_shift_2.mid', temperature=1.0, fixed_program=[0, 64],
                               generation_length=384, n_samples=8, prompt_length=16, ins_ids=['track-1', 'track-0'])
-            cond_continuation(model, '/home/theea/midi-function-alignment/test/input/predestinati108basicpitch3.mid', temperature=1.0, fixed_program=[64, 0],
-                              generation_length=384, n_samples=8, prompt_length=24, ins_ids=['track-0', 'track-1'])
+            # cond_continuation(model, '/home/theea/midi-function-alignment/test/input/predestinati108basicpitch3.mid', temperature=1.0, fixed_program=[64, 0],
+            #                   generation_length=384, n_samples=8, prompt_length=24, ins_ids=['track-0', 'track-1'])
             cond_continuation(model, 'input/ashover28_pitch_shift_-2.mid', temperature=1.0, fixed_program=[0, 64],
                               generation_length=384, n_samples=8, prompt_length=16, ins_ids=['track-1', 'track-0'])
             cond_continuation(model, 'input/ashover37_pitch_shift_-2.mid', temperature=1.0, fixed_program=[0, 64],
@@ -207,8 +207,8 @@ def eval_model(model_name):
         else:
             cond_continuation(model, 'input/ashover19_pitch_shift_2.mid', temperature=1.0, fixed_program=[64, 0],
                               generation_length=384, n_samples=8, prompt_length=24, ins_ids=['track-0', 'track-1'])
-            cond_continuation(model, '/home/theea/midi-function-alignment/test/input/predestinati108basicpitch3.mid', temperature=1.0, fixed_program=[64, 0],
-                              generation_length=384, n_samples=8, prompt_length=24, ins_ids=['track-0', 'track-1'])
+            # cond_continuation(model, '/home/theea/midi-function-alignment/test/input/predestinati108basicpitch3.mid', temperature=1.0, fixed_program=[64, 0],
+            #                   generation_length=384, n_samples=8, prompt_length=24, ins_ids=['track-0', 'track-1'])
             cond_continuation(model, 'input/ashover28_pitch_shift_-2.mid', temperature=1.0, fixed_program=[64, 0],
                               generation_length=384, n_samples=8, prompt_length=16, ins_ids=['track-0', 'track-1'])
             cond_continuation(model, 'input/ashover37_pitch_shift_-2.mid', temperature=1.0, fixed_program=[64, 0],

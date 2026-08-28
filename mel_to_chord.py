@@ -16,8 +16,9 @@ from preprocess_large_midi_dataset import preprocess_midi
 DEFAULT_BPM = 120.0
 DEFAULT_NUMERATOR = 4
 DEFAULT_DENOMINATOR = 4
+DEFAULT_QUANTIZATION = 16 #for 16ths
 
-DEFAULT_GENERATION_LENGTH = 384
+# DEFAULT_GENERATION_LENGTH = 384
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_SAMPLES = 1
 DEFAULT_SEED = 0
@@ -131,6 +132,10 @@ def get_midi_metadata(midi_path, cli_bpm=None, cli_time_signature=None):
         1. MIDI tempo map / time-signature map
         2. user supplied values
         3. defaults
+
+    The resolved BPM is normalized to 2 decimal places immediately.
+    The complete MIDI tempo/time-signature maps are preserved so they
+    can be copied to the output MIDI.
     """
 
     tempo_map = read_tempo_map(midi_path)
@@ -138,14 +143,22 @@ def get_midi_metadata(midi_path, cli_bpm=None, cli_time_signature=None):
 
     # Tempo
     if tempo_map:
-        bpm = tempo_map[0][1]
+        bpm = round(float(tempo_map[0][1]), 2)
         bpm_source = "MIDI tempo map"
     elif cli_bpm is not None:
-        bpm = float(cli_bpm)
+        bpm = round(float(cli_bpm), 2)
         bpm_source = "command line"
     else:
-        bpm = DEFAULT_BPM
+        bpm = round(float(DEFAULT_BPM), 2)
         bpm_source = "default"
+
+    # Normalize EVERY tempo-map entry immediately.
+    # This prevents values such as 108.000108000108 from
+    # propagating into the output MIDI tempo map.
+    normalized_tempo_map = [
+        (tick, round(float(event_bpm), 2))
+        for tick, event_bpm in tempo_map
+    ]
 
     # Time signature
     if time_signature_map:
@@ -160,14 +173,37 @@ def get_midi_metadata(midi_path, cli_bpm=None, cli_time_signature=None):
         time_signature_source = "default"
 
     return {
-        "bpm": float(bpm),
+        "bpm": bpm,
         "numerator": numerator,
         "denominator": denominator,
         "bpm_source": bpm_source,
         "time_signature_source": time_signature_source,
-        "tempo_map": tempo_map,
+
+        # Preserve the COMPLETE maps.
+        "tempo_map": normalized_tempo_map,
         "time_signature_map": time_signature_map,
     }
+
+# ---------------------------------------------------------------------------
+# INPUT MIDI FILE LENGTH
+# ---------------------------------------------------------------------------
+
+def read_input_length(midi_path):
+    midi = mido.MidiFile(midi_path)
+
+    max_tick = 0
+
+    for track in midi.tracks:
+        absolute_tick = 0
+
+        for msg in track:
+            absolute_tick += msg.time
+
+        max_tick = max(max_tick, absolute_tick)
+
+    return int(round((max_tick / midi.ticks_per_beat) * DEFAULT_QUANTIZATION / 4))
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +674,7 @@ def main():
     parser.add_argument(
         "--generation-length",
         type=int,
-        default=DEFAULT_GENERATION_LENGTH,
+        default=None,
     )
 
     parser.add_argument(
@@ -660,6 +696,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.generation_length is None:
+        args.generation_length = read_input_length(args.input)
 
     # ---------------------------------------------------------------
     # Read metadata BEFORE creating the synthetic prompt MIDI.
