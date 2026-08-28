@@ -806,47 +806,47 @@ def generate(
             # Each sample has its own generated chord history,
             # therefore continuation chunks must be generated
             # separately per sample.
-#EXCLUDE            
-            for i in range(samples):
+# #EXCLUDE            
+#             for i in range(samples):
 
-                previous_output = final_outputs[i]
+#                 previous_output = final_outputs[i]
 
-                # The previous output already contains the complete
-                # chord timeline generated so far.
-                chord_prompt = torch.stack(
-                    previous_output[
-                        prompt_start:prompt_end
-                    ],
-                    dim=1,
-                )
+#                 # The previous output already contains the complete
+#                 # chord timeline generated so far.
+#                 chord_prompt = torch.stack(
+#                     previous_output[
+#                         prompt_start:prompt_end
+#                     ],
+#                     dim=1,
+#                 )
 
-                # previous_output entries have shape [1, 32].
-                # stack(..., dim=1) therefore gives [1, 32, 32].
-                assert chord_prompt.shape[1] == overlap, (
-                    f"Expected {overlap} prompt steps, got "
-                    f"{chord_prompt.shape[1]}"
-                )
+#                 # previous_output entries have shape [1, 32].
+#                 # stack(..., dim=1) therefore gives [1, 32, 32].
+#                 assert chord_prompt.shape[1] == overlap, (
+#                     f"Expected {overlap} prompt steps, got "
+#                     f"{chord_prompt.shape[1]}"
+#                 )
 
-                with torch.no_grad():
+#                 with torch.no_grad():
 
-                    output = model.global_sampling(
-                        melody_chunk,
-                        chord_prompt,
-                        temperature=temperature,
-                    )
+#                     output = model.global_sampling(
+#                         melody_chunk,
+#                         chord_prompt,
+#                         temperature=temperature,
+#                     )
 
-                output_i = [
-                    output[j][0:1, :]
-                    for j in range(len(output))
-                ]
+#                 output_i = [
+#                     output[j][0:1, :]
+#                     for j in range(len(output))
+#                 ]
 
-                # The first `overlap` positions are the prompt we
-                # supplied to this generation.  They overlap the
-                # previous chunk, so do NOT append them again.
-                new_output = output_i[overlap:]
+#                 # The first `overlap` positions are the prompt we
+#                 # supplied to this generation.  They overlap the
+#                 # previous chunk, so do NOT append them again.
+#                 new_output = output_i[overlap:]
 
-                final_outputs[i].extend(new_output)
-#END EXCLUDE
+#                 final_outputs[i].extend(new_output)
+# #END EXCLUDE
 #NEW-INCLUDE
             # Build one chord prompt per sample.
             #
