@@ -847,6 +847,71 @@ def generate(
 
                 final_outputs[i].extend(new_output)
 #END EXCLUDE
+#NEW-INCLUDE
+            # Build one chord prompt per sample.
+            #
+            # Each sample has its own generated chord history, so
+            # each sample gets a different 32-step prompt.
+            #
+            # We batch those prompts together so Yinyang Sampling
+            # is called ONCE for all samples.
+
+            chord_prompts = []
+
+            for i in range(samples):
+
+                previous_output = final_outputs[i]
+
+                prompt_tokens = previous_output[
+                    prompt_start:prompt_end
+                ]
+
+                # 32 x [1, 32] -> [1, 32, 32]
+                chord_prompt = torch.stack(
+                    prompt_tokens,
+                    dim=1,
+                )
+
+                chord_prompts.append(chord_prompt)
+
+            # [samples, prompt_length, 32]
+            prompt_batch = torch.cat(
+                chord_prompts,
+                dim=0,
+            )
+
+            # Same melody conditioning for every sample.
+            melody_batch = melody_chunk.repeat(
+                samples,
+                1,
+                1,
+            )
+
+            with torch.no_grad():
+
+                output = model.global_sampling(
+                    melody_batch,
+                    prompt_batch,
+                    temperature=temperature,
+                )
+
+            # Each output is the COMPLETE chunk:
+            #
+            #   [32-step prompt][new generation]
+            #
+            # Keep only the new portion. The prompt overlap is already
+            # present in the previous chunk.
+            for i in range(samples):
+
+                output_i = [
+                    output[j][i:i + 1, :]
+                    for j in range(len(output))
+                ]
+
+                new_output = output_i[overlap:]
+
+                final_outputs[i].extend(new_output)
+#END NEW-INCLUDE                
 
         previous_chunk_end = chunk_end
         if previous_chunk_end >= generation_length:
