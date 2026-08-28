@@ -504,6 +504,46 @@ def get_unquantized_melody(
 
     return concat_result
 
+# ---------------------------------------------------------------------------
+# Final cleanup - remove the synthetic prompt initially injected at 0-32
+# used just before writing the output files
+# ---------------------------------------------------------------------------
+def remove_initial_chord_notes(midi_path, cutoff_steps):
+    """
+    Remove chord note events from the first `cutoff_steps` 16th-note
+    positions while preserving the MIDI timeline.
+    """
+
+    midi = mido.MidiFile(midi_path)
+
+    cutoff_tick = int(
+        cutoff_steps * midi.ticks_per_beat / 4
+    )
+
+    for track in midi.tracks:
+
+        absolute_tick = 0
+        retained = []
+
+        for msg in track:
+            absolute_tick += msg.time
+
+            if msg.type in ("note_on", "note_off"):
+                if absolute_tick < cutoff_tick:
+                    continue
+
+            retained.append((absolute_tick, msg.copy()))
+
+        track.clear()
+
+        previous_tick = 0
+
+        for absolute_tick, msg in retained:
+            msg.time = absolute_tick - previous_tick
+            track.append(msg)
+            previous_tick = absolute_tick
+
+    midi.save(midi_path)
 
 def generate(
     model,
@@ -571,36 +611,275 @@ def generate(
         fixed_tempo=bpm,
     )
 
-    with torch.no_grad():
+# #OLD START
+#     with torch.no_grad():
 
-        x1 = x1.repeat(samples, 1, 1)
-        x2 = x2.repeat(samples, 1, 1)
+#         x1 = x1.repeat(samples, 1, 1)
+#         x2 = x2.repeat(samples, 1, 1)
 
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        np.random.seed(seed)
+#         torch.manual_seed(seed)
+#         torch.cuda.manual_seed_all(seed)
+#         np.random.seed(seed)
 
-        print("Generating...")
+#         print("Generating...")
 
-        output = model.global_sampling(
-            x1,
-            x2,
-            temperature=temperature,
+#         output = model.global_sampling(
+#             x1,
+#             x2,
+#             temperature=temperature,
+#         )
+
+#     for i in range(samples):
+
+#         output_i = [
+#             output[j][i:i + 1, :]
+#             for j in range(len(output))
+#         ]
+
+#         output_file = os.path.join(
+#             output_dir,
+#             f"proposal_{i + 1:02d}.mid",
+#         )
+
+#         print(f"Writing: {output_file}")
+
+#         decode_output(
+#             (output_i,),
+#             output_file,
+#             ratio=(
+#                 model.compress_ratio_l,
+#                 model.compress_ratio_r,
+#             ),
+#             tempo=bpm,
+#             velocity=100,
+#             fixed_program=CHORD_PROGRAM,
+#             extra_instruments=extra_melody,
+#         )
+# #OLD END
+
+#NEW START
+    # ------------------------------------------------------------------
+    # Chord generation
+    #
+    # The model was trained with a 384-step sequence length.
+    #
+    # For longer inputs, generate overlapping chunks:
+    #
+    #   Chunk 1:  0       -> 384
+    #   Chunk 2:  352     -> 736
+    #   Chunk 3:  704     -> 1088
+    #   ...
+    #
+    # Each new chunk uses the previous 32 generated chord steps as
+    # its prompt.  The complete new chunk is generated, but its first
+    # 32 steps are the prompt overlap and are therefore discarded when
+    # stitching the final result.
+    # ------------------------------------------------------------------
+
+    MODEL_MAX_LENGTH = 384
+    overlap = prompt_length
+
+    if overlap >= MODEL_MAX_LENGTH:
+        raise ValueError(
+            f"Prompt length ({overlap}) must be smaller than "
+            f"model maximum length ({MODEL_MAX_LENGTH})."
         )
 
-    for i in range(samples):
+    # One output list per requested sample.
+    final_outputs = [[] for _ in range(samples)]
 
-        output_i = [
-            output[j][i:i + 1, :]
-            for j in range(len(output))
-        ]
+    chunk_start = 0
+    chunk_number = 1
+
+    print("Generating...")
+
+    while chunk_start < generation_length:
+
+        # The first chunk starts at zero.
+        #
+        # Every subsequent chunk starts `overlap` steps before the
+        # previous chunk ended.
+        if chunk_number == 1:
+            chunk_start = 0
+        else:
+            chunk_start = previous_chunk_end - overlap
+
+        chunk_end = min(
+            chunk_start + MODEL_MAX_LENGTH,
+            generation_length,
+        )
+
+        chunk_length = chunk_end - chunk_start
+
+        print()
+        print(
+            f"CHUNK {chunk_number}: "
+            f"{chunk_start}:{chunk_end} "
+            f"({chunk_length} steps)"
+        )
+
+        # Melody conditioning for this chunk.
+        melody_chunk = x1[:, chunk_start:chunk_end]
+
+        # --------------------------------------------------------------
+        # First chunk:
+        # use the artificial two-bar prompt exactly as before.
+        # --------------------------------------------------------------
+        if chunk_number == 1:
+
+            chord_prompt = x2
+
+            print(
+                f"  Melody: {chunk_start}:{chunk_end}"
+            )
+            print(
+                f"  Chord prompt: artificial "
+                f"{prompt_length} steps"
+            )
+
+            # Generate all samples together.
+            with torch.no_grad():
+
+                torch.manual_seed(seed)
+                torch.cuda.manual_seed_all(seed)
+                np.random.seed(seed)
+
+                melody_batch = melody_chunk.repeat(
+                    samples, 1, 1
+                )
+
+                prompt_batch = chord_prompt.repeat(
+                    samples, 1, 1
+                )
+
+                output = model.global_sampling(
+                    melody_batch,
+                    prompt_batch,
+                    temperature=temperature,
+                )
+
+            for i in range(samples):
+
+                output_i = [
+                    output[j][i:i + 1, :]
+                    for j in range(len(output))
+                ]
+
+                final_outputs[i].extend(output_i)
+
+        # --------------------------------------------------------------
+        # Subsequent chunks:
+        #
+        # Use the last `overlap` generated chord steps from the
+        # previous chunk as the new prompt.
+        #
+        # Example:
+        #
+        #   previous chunk = 0:384
+        #   prompt         = 352:384
+        #   new chunk      = 352:483
+        #
+        # The returned 352:483 chunk contains the 32-step prompt at
+        # its beginning.  We discard those 32 steps when stitching.
+        # --------------------------------------------------------------
+        else:
+
+            prompt_start = chunk_start
+            prompt_end = chunk_start + overlap
+
+            print(
+                f"  Melody: {chunk_start}:{chunk_end}"
+            )
+            print(
+                f"  Chord prompt: "
+                f"{prompt_start}:{prompt_end}"
+            )
+            print(
+                f"  Generated chunk: "
+                f"{chunk_start}:{chunk_end}"
+            )
+            print(
+                f"  Retained: "
+                f"{prompt_end}:{chunk_end}"
+            )
+
+            # Each sample has its own generated chord history,
+            # therefore continuation chunks must be generated
+            # separately per sample.
+#EXCLUDE            
+            for i in range(samples):
+
+                previous_output = final_outputs[i]
+
+                # The previous output already contains the complete
+                # chord timeline generated so far.
+                chord_prompt = torch.stack(
+                    previous_output[
+                        prompt_start:prompt_end
+                    ],
+                    dim=1,
+                )
+
+                # previous_output entries have shape [1, 32].
+                # stack(..., dim=1) therefore gives [1, 32, 32].
+                assert chord_prompt.shape[1] == overlap, (
+                    f"Expected {overlap} prompt steps, got "
+                    f"{chord_prompt.shape[1]}"
+                )
+
+                with torch.no_grad():
+
+                    output = model.global_sampling(
+                        melody_chunk,
+                        chord_prompt,
+                        temperature=temperature,
+                    )
+
+                output_i = [
+                    output[j][0:1, :]
+                    for j in range(len(output))
+                ]
+
+                # The first `overlap` positions are the prompt we
+                # supplied to this generation.  They overlap the
+                # previous chunk, so do NOT append them again.
+                new_output = output_i[overlap:]
+
+                final_outputs[i].extend(new_output)
+#END EXCLUDE
+
+        previous_chunk_end = chunk_end
+        if previous_chunk_end >= generation_length:
+            break
+        chunk_number += 1
+
+    # ------------------------------------------------------------------
+    # Sanity check
+    # ------------------------------------------------------------------
+
+    for i, output_i in enumerate(final_outputs):
+
+        if len(output_i) != generation_length:
+            raise RuntimeError(
+                f"Sample {i + 1}: expected "
+                f"{generation_length} chord steps, got "
+                f"{len(output_i)}"
+            )
+
+    # ------------------------------------------------------------------
+    # Write final MIDI files.
+    # ------------------------------------------------------------------
+
+    for i, output_i in enumerate(final_outputs):
 
         output_file = os.path.join(
             output_dir,
             f"proposal_{i + 1:02d}.mid",
         )
 
-        print(f"Writing: {output_file}")
+        print(
+            f"Writing: {output_file}"
+        )
 
         decode_output(
             (output_i,),
@@ -614,6 +893,11 @@ def generate(
             fixed_program=CHORD_PROGRAM,
             extra_instruments=extra_melody,
         )
+        remove_initial_chord_notes(
+            output_file,
+            cutoff_steps=prompt_length,
+        )
+#NEW END
 
     print()
     print("DONE.")
