@@ -6,7 +6,7 @@ from settings import RWC_DATASET_PATH
 import torch
 import pretty_midi
 import os
-def decode_output(outputs, save_path=None, tempo=120.0, ratio=1.0, velocity=100, with_velocity=False, extra_instruments=None, fixed_program=None):
+def decode_output(outputs, save_path=None, tempo=120.0, ratio=1.0, velocity=100, with_velocity=False, extra_instruments=None, fixed_program=None, min_pitch=None):
     assert with_velocity == False, 'Velocity is not supported yet'
     tokenizer = CPTokenizer(with_velocity=with_velocity)
     midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
@@ -36,6 +36,9 @@ def decode_output(outputs, save_path=None, tempo=120.0, ratio=1.0, velocity=100,
                 if pitch < 0 or pitch >= 128:
                     print('Invalid pitch:', pitch, '@', time_step, i)
                     break
+                if min_pitch is not None:
+                    while pitch < min_pitch:
+                        pitch += 12
                 if duration < 0 or duration >= len(DURATION_TEMPLATES):
                     print('Invalid duration:', duration, '@', time_step, i)
                     break

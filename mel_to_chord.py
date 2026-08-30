@@ -956,6 +956,7 @@ def generate(
             tempo=bpm,
             velocity=100,
             fixed_program=CHORD_PROGRAM,
+            min_pitch=45,
             extra_instruments=extra_melody,
         )
         remove_initial_chord_notes(
