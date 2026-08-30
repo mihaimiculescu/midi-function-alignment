@@ -72,6 +72,7 @@ from tqdm import tqdm
 import numpy as np
 from pretty_midi_fix import UglyMIDI
 # import pretty_midi
+import math
 
 
 # ============================================================================
@@ -181,6 +182,82 @@ STAGE2_FILTERS = {
 
     # Reject files that cannot be parsed by UglyMIDI.
     "reject_parse_errors": True,
+
+}
+
+# ============================================================================
+# STAGE 2 RESUME CHECK
+# ============================================================================
+
+STAGE2_CANDIDATES_TXT = (
+    OUTPUT_DIR
+    / "stage2"
+    / "candidates.txt"
+)
+
+
+def load_manifest(path):
+    """
+    Load a newline-separated MIDI path manifest.
+    """
+    with open(
+        path,
+        "r",
+        encoding="utf-8"
+    ) as fh:
+
+        return [
+            line.strip()
+            for line in fh
+            if line.strip()
+        ]
+
+
+def stage2_is_complete():
+    """
+    Stage 2 is considered complete if its survivor manifest exists
+    and contains at least one MIDI path.
+    """
+
+    if not STAGE2_CANDIDATES_TXT.exists():
+        return False
+
+    try:
+
+        with open(
+            STAGE2_CANDIDATES_TXT,
+            "r",
+            encoding="utf-8"
+        ) as fh:
+
+            for line in fh:
+
+                if line.strip():
+
+                    return True
+
+    except OSError:
+
+        return False
+
+    return False
+
+# ============================================================================
+# STAGE 3 — MIDI MUSICAL STRUCTURE ANALYSIS
+# ============================================================================
+
+STAGE3_FILTERS = {
+
+    # General MIDI percussion channel.
+    # MIDI channel numbers in the MIDI file representation are 0-based,
+    # therefore GM channel 10 is represented as channel 9.
+    "excluded_channels": {9, 15},
+
+    # Ignore tiny tracks when considering melody candidates.
+    "min_notes_for_candidate": 8,
+
+    # Maximum number of candidate tracks retained in the report.
+    "max_candidates_per_file": 8,
 
 }
 
@@ -1028,7 +1105,680 @@ def analyze_stage2_quantization(
         "total_notes":
             total_notes,
     }, None
-        
+
+# ============================================================================
+# STAGE 3 HELPERS
+# ============================================================================
+
+def _safe_mean(values):
+    if not values:
+        return 0.0
+
+    return float(
+        sum(values) / len(values)
+    )
+
+
+def _safe_median(values):
+    if not values:
+        return 0.0
+
+    values = sorted(values)
+    n = len(values)
+
+    if n % 2:
+        return float(values[n // 2])
+
+    return float(
+        (values[n // 2 - 1] + values[n // 2]) / 2
+    )
+
+
+def _calculate_polyphony(notes):
+    """
+    Estimate average simultaneous-note density.
+
+    We count how many notes overlap each note onset and normalize
+    around monophonic material.
+
+    1.0 approximately means monophonic.
+    Higher values indicate increasing polyphony.
+    """
+
+    if not notes:
+        return 0.0
+
+    starts = []
+
+    for note in notes:
+        starts.append(
+            (
+                float(note.start),
+                float(note.end),
+            )
+        )
+
+    overlap_sum = 0.0
+
+    for start, end in starts:
+
+        overlapping = 0
+
+        for other_start, other_end in starts:
+
+            if (
+                other_start < end
+                and other_end > start
+            ):
+                overlapping += 1
+
+        overlap_sum += overlapping
+
+    return float(
+        overlap_sum / len(notes)
+    )
+
+
+def _calculate_pitch_range(notes):
+
+    if not notes:
+        return 0
+
+    pitches = [
+        int(note.pitch)
+        for note in notes
+    ]
+
+    return max(pitches) - min(pitches)
+
+
+def _calculate_pitch_mean(notes):
+
+    if not notes:
+        return 0.0
+
+    return _safe_mean(
+        [
+            float(note.pitch)
+            for note in notes
+        ]
+    )
+
+
+def _calculate_note_duration_stats(notes):
+
+    durations = []
+
+    for note in notes:
+
+        duration = (
+            float(note.end)
+            -
+            float(note.start)
+        )
+
+        if duration > 0:
+            durations.append(duration)
+
+    if not durations:
+        return {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+
+    return {
+        "mean":
+            _safe_mean(durations),
+
+        "median":
+            _safe_median(durations),
+
+        "min":
+            float(min(durations)),
+
+        "max":
+            float(max(durations)),
+    }
+
+
+def _calculate_activity_span(notes):
+
+    if not notes:
+        return 0.0
+
+    start = min(
+        float(note.start)
+        for note in notes
+    )
+
+    end = max(
+        float(note.end)
+        for note in notes
+    )
+
+    return max(
+        0.0,
+        end - start
+    )
+
+
+def _calculate_note_density(notes):
+
+    if not notes:
+        return 0.0
+
+    span = _calculate_activity_span(
+        notes
+    )
+
+    if span <= 0:
+        return 0.0
+
+    return float(
+        len(notes) / span
+    )
+
+
+def _calculate_monophonic_fraction(notes):
+
+    """
+    Fraction of note onsets which do not have another note sounding
+    simultaneously.
+
+    Melody lines tend to have a relatively high value, although this
+    is deliberately only one component of the melody score.
+    """
+
+    if not notes:
+        return 0.0
+
+    isolated = 0
+
+    for note in notes:
+
+        overlaps = False
+
+        for other in notes:
+
+            if other is note:
+                continue
+
+            if (
+                float(other.start)
+                < float(note.end)
+                and
+                float(other.end)
+                > float(note.start)
+            ):
+
+                overlaps = True
+                break
+
+        if not overlaps:
+            isolated += 1
+
+    return float(
+        isolated / len(notes)
+    )
+
+
+def _calculate_channel_information(
+    instrument
+):
+
+    channels = set()
+
+    # PrettyMIDI instruments normally have one program/channel.
+    # Some project representations may expose channel information
+    # differently, so be defensive.
+    if hasattr(
+        instrument,
+        "channel"
+    ):
+
+        try:
+            channels.add(
+                int(instrument.channel)
+            )
+        except (
+            TypeError,
+            ValueError
+        ):
+            pass
+
+    if hasattr(
+        instrument,
+        "channels"
+    ):
+
+        try:
+
+            for channel in instrument.channels:
+
+                channels.add(
+                    int(channel)
+                )
+
+        except Exception:
+            pass
+
+    return sorted(
+        channels
+    )
+
+
+def _melody_score(
+    notes,
+    polyphony,
+    pitch_range,
+    activity_span,
+    note_density,
+    monophonic_fraction,
+):
+    """
+    Heuristic melody likelihood.
+
+    This is NOT intended to identify the melody with certainty.
+
+    It produces a ranking score so that Stage 3 can tell us:
+
+        "These tracks look melody-like."
+
+    rather than making an irreversible selection.
+    """
+
+    if not notes:
+        return 0.0
+
+    score = 0.0
+
+    # --------------------------------------------------------------
+    # Monophonic material is strongly melody-like.
+    # --------------------------------------------------------------
+
+    score += (
+        monophonic_fraction
+        * 0.35
+    )
+
+    # --------------------------------------------------------------
+    # Moderate polyphony is acceptable.
+    #
+    # A melody can occasionally contain doubled notes/chords.
+    # Penalize increasingly dense polyphony.
+    # --------------------------------------------------------------
+
+    if polyphony <= 1.15:
+
+        polyphony_score = 1.0
+
+    elif polyphony <= 1.5:
+
+        polyphony_score = 0.75
+
+    elif polyphony <= 2.0:
+
+        polyphony_score = 0.45
+
+    else:
+
+        polyphony_score = 0.10
+
+    score += (
+        polyphony_score
+        * 0.25
+    )
+
+    # --------------------------------------------------------------
+    # Useful melodic pitch range.
+    # --------------------------------------------------------------
+
+    if 12 <= pitch_range <= 48:
+
+        range_score = 1.0
+
+    elif 7 <= pitch_range < 12:
+
+        range_score = 0.65
+
+    elif 48 < pitch_range <= 60:
+
+        range_score = 0.70
+
+    else:
+
+        range_score = 0.30
+
+    score += (
+        range_score
+        * 0.15
+    )
+
+    # --------------------------------------------------------------
+    # Some sustained activity across the piece.
+    # --------------------------------------------------------------
+
+    if activity_span > 0:
+
+        density_score = min(
+            1.0,
+            note_density / 2.0
+        )
+
+    else:
+
+        density_score = 0.0
+
+    score += (
+        density_score
+        * 0.10
+    )
+
+    # --------------------------------------------------------------
+    # Number of notes.
+    #
+    # Enough notes to constitute a meaningful musical line.
+    # --------------------------------------------------------------
+
+    if len(notes) >= 100:
+
+        note_count_score = 1.0
+
+    elif len(notes) >= 50:
+
+        note_count_score = 0.8
+
+    elif len(notes) >= 20:
+
+        note_count_score = 0.6
+
+    else:
+
+        note_count_score = 0.3
+
+    score += (
+        note_count_score
+        * 0.05
+    )
+
+    return float(
+        max(
+            0.0,
+            min(
+                1.0,
+                score
+            )
+        )
+    )
+
+
+def analyze_stage3_midi(
+    midi_path
+):
+
+    """
+    Analyze one MIDI file for melody-like track candidates.
+
+    Returns:
+
+        {
+            "md5": ...,
+            "tracks_with_notes": ...,
+            "non_percussion_notes": ...,
+            "candidates": [...]
+        }
+
+    or:
+
+        (None, reason)
+    """
+
+    try:
+
+        midi = UglyMIDI(
+            str(midi_path)
+        )
+
+    except Exception as exc:
+
+        return None, (
+            "midi_parse_error:"
+            + type(exc).__name__
+        )
+
+    try:
+
+        track_reports = []
+
+        total_non_percussion_notes = 0
+
+        tracks_with_notes = 0
+
+        # ----------------------------------------------------------
+        # Examine every instrument/track.
+        # ----------------------------------------------------------
+
+        for track_index, instrument in enumerate(
+            midi.instruments
+        ):
+
+            raw_notes = list(
+                instrument.notes
+            )
+
+            if not raw_notes:
+                continue
+
+            tracks_with_notes += 1
+
+            channels = (
+                _calculate_channel_information(
+                    instrument
+                )
+            )
+
+            # ------------------------------------------------------
+            # Remove percussion channels.
+            #
+            # We deliberately remove the NOTES rather than deleting
+            # the whole track.
+            # ------------------------------------------------------
+
+            filtered_notes = []
+
+            for note in raw_notes:
+
+                channel = getattr(
+                    note,
+                    "channel",
+                    None
+                )
+
+                if channel in STAGE3_FILTERS[
+                    "excluded_channels"
+                ]:
+                    continue
+
+                filtered_notes.append(
+                    note
+                )
+
+            if not filtered_notes:
+                continue
+
+            total_non_percussion_notes += (
+                len(filtered_notes)
+            )
+
+            if len(filtered_notes) < STAGE3_FILTERS[
+                "min_notes_for_candidate"
+            ]:
+                continue
+
+            pitch_range = (
+                _calculate_pitch_range(
+                    filtered_notes
+                )
+            )
+
+            polyphony = (
+                _calculate_polyphony(
+                    filtered_notes
+                )
+            )
+
+            activity_span = (
+                _calculate_activity_span(
+                    filtered_notes
+                )
+            )
+
+            note_density = (
+                _calculate_note_density(
+                    filtered_notes
+                )
+            )
+
+            monophonic_fraction = (
+                _calculate_monophonic_fraction(
+                    filtered_notes
+                )
+            )
+
+            duration_stats = (
+                _calculate_note_duration_stats(
+                    filtered_notes
+                )
+            )
+
+            pitch_mean = (
+                _calculate_pitch_mean(
+                    filtered_notes
+                )
+            )
+
+            score = _melody_score(
+                filtered_notes,
+                polyphony,
+                pitch_range,
+                activity_span,
+                note_density,
+                monophonic_fraction,
+            )
+
+            track_reports.append(
+                {
+                    "track":
+                        track_index,
+
+                    "channels":
+                        channels,
+
+                    "program":
+                        getattr(
+                            instrument,
+                            "program",
+                            None
+                        ),
+
+                    "is_drum":
+                        bool(
+                            getattr(
+                                instrument,
+                                "is_drum",
+                                False
+                            )
+                        ),
+
+                    "raw_notes":
+                        len(raw_notes),
+
+                    "non_percussion_notes":
+                        len(filtered_notes),
+
+                    "polyphony":
+                        round(
+                            polyphony,
+                            4
+                        ),
+
+                    "monophonic_fraction":
+                        round(
+                            monophonic_fraction,
+                            4
+                        ),
+
+                    "pitch_range":
+                        pitch_range,
+
+                    "pitch_mean":
+                        round(
+                            pitch_mean,
+                            2
+                        ),
+
+                    "note_density":
+                        round(
+                            note_density,
+                            4
+                        ),
+
+                    "activity_span":
+                        round(
+                            activity_span,
+                            4
+                        ),
+
+                    "duration":
+                        duration_stats,
+
+                    "melody_score":
+                        round(
+                            score,
+                            4
+                        ),
+                }
+            )
+
+        # ----------------------------------------------------------
+        # Rank candidates.
+        # ----------------------------------------------------------
+
+        track_reports.sort(
+            key=lambda item:
+                item["melody_score"],
+            reverse=True,
+        )
+
+        track_reports = track_reports[
+            :STAGE3_FILTERS[
+                "max_candidates_per_file"
+            ]
+        ]
+
+        return {
+            "tracks_with_notes":
+                tracks_with_notes,
+
+            "non_percussion_notes":
+                total_non_percussion_notes,
+
+            "candidate_count":
+                len(track_reports),
+
+            "candidates":
+                track_reports,
+        }, None
+
+    except Exception as exc:
+
+        return None, (
+            "midi_analysis_error:"
+            + type(exc).__name__
+        )
+
 # ============================================================================
 # BUILD MIDI INDEX
 # ============================================================================
@@ -2055,51 +2805,475 @@ def main():
     print(SUMMARY_JSON1B)
     print(REJECTIONS_JSON1B)
 
-    # =========================================================================
+    # ============================================================================
     # STAGE 2
+    # ============================================================================
+
+    if stage2_is_complete():
+
+        print()
+        print("=" * 70)
+        print("STAGE 2 ALREADY COMPLETE")
+        print("=" * 70)
+        print()
+
+        print(
+            "Stage 2 survivor manifest found:"
+        )
+
+        print(
+            f"  {STAGE2_CANDIDATES_TXT}"
+        )
+
+        print()
+
+        stage2_survivors = load_manifest(
+            STAGE2_CANDIDATES_TXT
+        )
+
+        print(
+            f"Loaded Stage 2 survivors: "
+            f"{len(stage2_survivors):,}"
+        )
+
+        print()
+
+        print(
+            "Skipping Stage 2 processing."
+        )
+
+        print(
+            "Proceeding directly to Stage 3."
+        )
+
+    else:
+
+        print()
+        print("=" * 70)
+        print("STAGE 2 NOT COMPLETE")
+        print("=" * 70)
+        print()
+
+        print(
+            "Stage 2 survivor manifest not found."
+        )
+
+        print(
+            "Running Stage 2..."
+        )
+
+        print()
+
+        # ------------------------------------------------------------------------
+        # EXISTING STAGE 2 CODE GOES HERE
+        # ------------------------------------------------------------------------
+
+        print()
+        print("=" * 70)
+        print("STAGE 2 — MIDI-LEVEL QUANTIZATION FILTER")
+        print("=" * 70)
+        print()
+
+        stage2_candidates = []
+        stage2_rejection_counts = Counter()
+        stage2_rejection_details = []
+
+        input_candidates = len(candidates)
+
+        print(
+            f"Input Stage 1 candidates: "
+            f"{input_candidates:,}"
+        )
+
+        print()
+        print(
+            "Parsing MIDI files and analyzing quantization..."
+        )
+        print()
+
+        for candidate in tqdm(
+            candidates,
+            total=len(candidates),
+        ):
+
+            midi_path = candidate["path"]
+
+            analysis, reason = analyze_stage2_quantization(
+                midi_path
+            )
+
+            if reason is not None:
+
+                stage2_rejection_counts[
+                    reason
+                ] += 1
+
+                stage2_rejection_details.append(
+                    {
+                        "md5":
+                            candidate["md5"],
+
+                        "path":
+                            midi_path,
+
+                        "reason":
+                            reason,
+                    }
+                )
+
+                continue
+
+            # --------------------------------------------------------------
+            # Preserve Stage 1 information and append Stage 2 information.
+            # --------------------------------------------------------------
+
+            stage2_candidate = dict(
+                candidate
+            )
+
+            stage2_candidate[
+                "stage2"
+            ] = analysis
+
+            stage2_candidates.append(
+                stage2_candidate
+            )
+
+        # =========================================================================
+        # STAGE 2 REPORT
+        # =========================================================================
+
+        stage2_input_count = (
+            len(candidates)
+        )
+
+        stage2_survivor_count = (
+            len(stage2_candidates)
+        )
+
+        stage2_rejected_count = (
+            stage2_input_count
+            -
+            stage2_survivor_count
+        )
+
+        print()
+        print("=" * 70)
+        print("STAGE 2 COMPLETE")
+        print("=" * 70)
+        print()
+
+        print(
+            f"Input candidates       : "
+            f"{stage2_input_count:,}"
+        )
+
+        print(
+            f"Survivors              : "
+            f"{stage2_survivor_count:,}"
+        )
+
+        print(
+            f"Rejected               : "
+            f"{stage2_rejected_count:,}"
+        )
+
+        if stage2_input_count:
+
+            print(
+                f"Survivor ratio         : "
+                f"{stage2_survivor_count / stage2_input_count:.4f}"
+            )
+
+        print()
+
+        print(
+            "Rejection reasons:"
+        )
+
+        print("-" * 70)
+
+        for reason, count in (
+            stage2_rejection_counts
+            .most_common()
+        ):
+
+            print(
+                f"{reason:40s}"
+                f"{count:10,}"
+            )
+
+        # =========================================================================
+        # STAGE 2 OUTPUT
+        # =========================================================================
+
+        STAGE2_DIR = (
+            OUTPUT_DIR /
+            "stage2"
+        )
+
+        STAGE2_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        STAGE2_CANDIDATES_TXT = (
+            STAGE2_DIR /
+            "candidates.txt"
+        )
+
+        STAGE2_CANDIDATES_JSON = (
+            STAGE2_DIR /
+            "candidates.json"
+        )
+
+        STAGE2_SUMMARY_JSON = (
+            STAGE2_DIR /
+            "summary.json"
+        )
+
+        STAGE2_REJECTIONS_JSON = (
+            STAGE2_DIR /
+            "rejections.json"
+        )
+
+        print()
+        print("=" * 70)
+        print("Writing Stage 2 survivor manifests...")
+        print("=" * 70)
+        print()
+
+        # --------------------------------------------------------------
+        # Plain path manifest
+        # --------------------------------------------------------------
+
+        with open(
+            STAGE2_CANDIDATES_TXT,
+            "w",
+            encoding="utf-8",
+        ) as fh:
+
+            for candidate in stage2_candidates:
+
+                fh.write(
+                    candidate["path"]
+                    + "\n"
+                )
+
+        print(
+            STAGE2_CANDIDATES_TXT
+        )
+
+        # --------------------------------------------------------------
+        # Detailed candidate JSON
+        # --------------------------------------------------------------
+
+        with open(
+            STAGE2_CANDIDATES_JSON,
+            "w",
+            encoding="utf-8",
+        ) as fh:
+
+            json.dump(
+                {
+                    "dataset":
+                        "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
+
+                    "stage":
+                        "2",
+
+                    "description":
+                        (
+                            "Stage 1 candidates filtered by "
+                            "actual MIDI parsing and "
+                            "time-signature-aware quantization."
+                        ),
+
+                    "input_manifest":
+                        str(CANDIDATES_TXT),
+
+                    "candidates":
+                        stage2_candidates,
+
+                },
+                fh,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        print(
+            STAGE2_CANDIDATES_JSON
+        )
+
+        # --------------------------------------------------------------
+        # Summary
+        # --------------------------------------------------------------
+
+        stage2_summary = {
+
+            "stage":
+                "2",
+
+            "description":
+                (
+                    "MIDI-level quantization filtering "
+                    "of Stage 1 candidates."
+                ),
+
+            "input_candidates":
+                stage2_input_count,
+
+            "survivors":
+                stage2_survivor_count,
+
+            "rejected":
+                stage2_rejected_count,
+
+            "survivor_ratio":
+                (
+                    stage2_survivor_count /
+                    stage2_input_count
+                    if stage2_input_count
+                    else 0
+                ),
+
+            "filters":
+                STAGE2_FILTERS,
+
+            "rejection_counts":
+                dict(
+                    stage2_rejection_counts
+                ),
+
+        }
+
+        with open(
+            STAGE2_SUMMARY_JSON,
+            "w",
+            encoding="utf-8",
+        ) as fh:
+
+            json.dump(
+                stage2_summary,
+                fh,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        print(
+            STAGE2_SUMMARY_JSON
+        )
+
+        # --------------------------------------------------------------
+        # Rejection details
+        # --------------------------------------------------------------
+
+        with open(
+            STAGE2_REJECTIONS_JSON,
+            "w",
+            encoding="utf-8",
+        ) as fh:
+
+            json.dump(
+                stage2_rejection_details,
+                fh,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        print(
+            STAGE2_REJECTIONS_JSON
+        )
+
+        print()
+        print("=" * 70)
+        print("STAGE 2 DONE")
+        print("=" * 70)
+        print()
+
+        print(
+            "No MIDI files were copied, moved, "
+            "or modified."
+        )
+
+        print()
+
+    # =========================================================================
+    # STAGE 3 — MUSICAL STRUCTURE / MELODY CANDIDATE ANALYSIS
     # =========================================================================
 
     print()
     print("=" * 70)
-    print("STAGE 2 — MIDI-LEVEL QUANTIZATION FILTER")
+    print("STAGE 3 — MUSICAL STRUCTURE ANALYSIS")
     print("=" * 70)
     print()
 
-    stage2_candidates = []
-    stage2_rejection_counts = Counter()
-    stage2_rejection_details = []
+    STAGE3_DIR = (
+        OUTPUT_DIR /
+        "stage3"
+    )
 
-    input_candidates = len(candidates)
+    STAGE3_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    STAGE3_CANDIDATES_TXT = (
+        STAGE3_DIR /
+        "candidates.txt"
+    )
+
+    STAGE3_REPORTS_JSON = (
+        STAGE3_DIR /
+        "reports.json"
+    )
+
+    STAGE3_SUMMARY_JSON = (
+        STAGE3_DIR /
+        "summary.json"
+    )
+
+    STAGE3_REJECTIONS_JSON = (
+        STAGE3_DIR /
+        "rejections.json"
+    )
 
     print(
-        f"Input Stage 1 candidates: "
-        f"{input_candidates:,}"
+        f"Input Stage 2 candidates: "
+        f"{len(stage2_candidates):,}"
     )
 
     print()
     print(
-        "Parsing MIDI files and analyzing quantization..."
+        "Analyzing MIDI track structure..."
     )
     print()
+
+    stage3_reports = []
+    stage3_survivors = []
+    stage3_rejection_counts = Counter()
+    stage3_rejection_details = []
 
     for candidate in tqdm(
-        candidates,
-        total=len(candidates),
+        stage2_candidates,
+        total=len(stage2_candidates),
     ):
 
         midi_path = candidate["path"]
 
-        analysis, reason = analyze_stage2_quantization(
-            midi_path
+        analysis, reason = (
+            analyze_stage3_midi(
+                midi_path
+            )
         )
 
         if reason is not None:
 
-            stage2_rejection_counts[
+            stage3_rejection_counts[
                 reason
             ] += 1
 
-            stage2_rejection_details.append(
+            stage3_rejection_details.append(
                 {
                     "md5":
                         candidate["md5"],
@@ -2115,77 +3289,109 @@ def main():
             continue
 
         # --------------------------------------------------------------
-        # Preserve Stage 1 information and append Stage 2 information.
+        # Preserve all earlier information.
         # --------------------------------------------------------------
 
-        stage2_candidate = dict(
+        stage3_candidate = dict(
             candidate
         )
 
-        stage2_candidate[
-            "stage2"
+        stage3_candidate[
+            "stage3"
         ] = analysis
 
-        stage2_candidates.append(
-            stage2_candidate
+        stage3_reports.append(
+            stage3_candidate
         )
 
+        # --------------------------------------------------------------
+        # At this stage we are NOT selecting a melody track.
+        #
+        # A file survives if it has at least one plausible
+        # non-percussion candidate.
+        # --------------------------------------------------------------
+
+        if analysis[
+            "candidate_count"
+        ] > 0:
+
+            stage3_survivors.append(
+                stage3_candidate
+            )
+
+        else:
+
+            stage3_rejection_counts[
+                "no_non_percussion_candidate"
+            ] += 1
+
+            stage3_rejection_details.append(
+                {
+                    "md5":
+                        candidate["md5"],
+
+                    "path":
+                        midi_path,
+
+                    "reason":
+                        "no_non_percussion_candidate",
+                }
+            )
+
     # =========================================================================
-    # STAGE 2 REPORT
+    # STAGE 3 REPORT
     # =========================================================================
 
-    stage2_input_count = (
-        len(candidates)
-    )
-
-    stage2_survivor_count = (
+    stage3_input_count = (
         len(stage2_candidates)
     )
 
-    stage2_rejected_count = (
-        stage2_input_count
+    stage3_survivor_count = (
+        len(stage3_survivors)
+    )
+
+    stage3_rejected_count = (
+        stage3_input_count
         -
-        stage2_survivor_count
+        stage3_survivor_count
     )
 
     print()
     print("=" * 70)
-    print("STAGE 2 COMPLETE")
+    print("STAGE 3 COMPLETE")
     print("=" * 70)
     print()
 
     print(
         f"Input candidates       : "
-        f"{stage2_input_count:,}"
+        f"{stage3_input_count:,}"
     )
 
     print(
         f"Survivors              : "
-        f"{stage2_survivor_count:,}"
+        f"{stage3_survivor_count:,}"
     )
 
     print(
         f"Rejected               : "
-        f"{stage2_rejected_count:,}"
+        f"{stage3_rejected_count:,}"
     )
 
-    if stage2_input_count:
+    if stage3_input_count:
 
         print(
             f"Survivor ratio         : "
-            f"{stage2_survivor_count / stage2_input_count:.4f}"
+            f"{stage3_survivor_count / stage3_input_count:.4f}"
         )
 
     print()
-
     print(
         "Rejection reasons:"
     )
-
     print("-" * 70)
 
     for reason, count in (
-        stage2_rejection_counts
+        stage3_rejection_counts
         .most_common()
     ):
 
@@ -2195,56 +3401,22 @@ def main():
         )
 
     # =========================================================================
-    # STAGE 2 OUTPUT
+    # WRITE STAGE 3 PATH MANIFEST
     # =========================================================================
 
-    STAGE2_DIR = (
-        OUTPUT_DIR /
-        "stage2"
-    )
-
-    STAGE2_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    STAGE2_CANDIDATES_TXT = (
-        STAGE2_DIR /
-        "candidates.txt"
-    )
-
-    STAGE2_CANDIDATES_JSON = (
-        STAGE2_DIR /
-        "candidates.json"
-    )
-
-    STAGE2_SUMMARY_JSON = (
-        STAGE2_DIR /
-        "summary.json"
-    )
-
-    STAGE2_REJECTIONS_JSON = (
-        STAGE2_DIR /
-        "rejections.json"
-    )
-
     print()
     print("=" * 70)
-    print("Writing Stage 2 survivor manifests...")
+    print("Writing Stage 3 survivor manifest...")
     print("=" * 70)
     print()
-
-    # --------------------------------------------------------------
-    # Plain path manifest
-    # --------------------------------------------------------------
 
     with open(
-        STAGE2_CANDIDATES_TXT,
+        STAGE3_CANDIDATES_TXT,
         "w",
         encoding="utf-8",
     ) as fh:
 
-        for candidate in stage2_candidates:
+        for candidate in stage3_survivors:
 
             fh.write(
                 candidate["path"]
@@ -2252,15 +3424,15 @@ def main():
             )
 
     print(
-        STAGE2_CANDIDATES_TXT
+        STAGE3_CANDIDATES_TXT
     )
 
-    # --------------------------------------------------------------
-    # Detailed candidate JSON
-    # --------------------------------------------------------------
+    # =========================================================================
+    # WRITE DETAILED REPORTS
+    # =========================================================================
 
     with open(
-        STAGE2_CANDIDATES_JSON,
+        STAGE3_REPORTS_JSON,
         "w",
         encoding="utf-8",
     ) as fh:
@@ -2271,21 +3443,29 @@ def main():
                     "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
 
                 "stage":
-                    "2",
+                    "3",
 
                 "description":
                     (
-                        "Stage 1 candidates filtered by "
-                        "actual MIDI parsing and "
-                        "time-signature-aware quantization."
+                        "MIDI structural analysis and melody "
+                        "candidate ranking. No MIDI files are "
+                        "copied, moved, or modified."
                     ),
 
                 "input_manifest":
-                    str(CANDIDATES_TXT),
+                    str(
+                        STAGE2_CANDIDATES_TXT
+                    ),
 
-                "candidates":
-                    stage2_candidates,
+                "excluded_channels":
+                    sorted(
+                        STAGE3_FILTERS[
+                            "excluded_channels"
+                        ]
+                    ),
 
+                "reports":
+                    stage3_reports,
             },
             fh,
             indent=2,
@@ -2293,98 +3473,133 @@ def main():
         )
 
     print(
-        STAGE2_CANDIDATES_JSON
+        STAGE3_REPORTS_JSON
     )
 
-    # --------------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------------
+    # =========================================================================
+    # WRITE SUMMARY
+    # =========================================================================
 
-    stage2_summary = {
+    stage3_summary = {
 
         "stage":
-            "2",
+            "3",
 
         "description":
             (
-                "MIDI-level quantization filtering "
-                "of Stage 1 candidates."
+                "MIDI musical-structure analysis and "
+                "melody-candidate ranking."
+            ),
+
+        "input_manifest":
+            str(
+                STAGE2_CANDIDATES_TXT
+            ),
+
+        "output_manifest":
+            str(
+                STAGE3_CANDIDATES_TXT
             ),
 
         "input_candidates":
-            stage2_input_count,
+            stage3_input_count,
 
         "survivors":
-            stage2_survivor_count,
+            stage3_survivor_count,
 
         "rejected":
-            stage2_rejected_count,
+            stage3_rejected_count,
 
         "survivor_ratio":
             (
-                stage2_survivor_count /
-                stage2_input_count
-                if stage2_input_count
+                stage3_survivor_count
+                / stage3_input_count
+                if stage3_input_count
                 else 0
             ),
 
-        "filters":
-            STAGE2_FILTERS,
+        "excluded_channels":
+            sorted(
+                STAGE3_FILTERS[
+                    "excluded_channels"
+                ]
+            ),
 
         "rejection_counts":
             dict(
-                stage2_rejection_counts
+                stage3_rejection_counts
             ),
 
+        "outputs":
+            {
+                "candidate_paths":
+                    str(
+                        STAGE3_CANDIDATES_TXT
+                    ),
+
+                "reports":
+                    str(
+                        STAGE3_REPORTS_JSON
+                    ),
+
+                "summary":
+                    str(
+                        STAGE3_SUMMARY_JSON
+                    ),
+
+                "rejections":
+                    str(
+                        STAGE3_REJECTIONS_JSON
+                    ),
+            },
     }
 
     with open(
-        STAGE2_SUMMARY_JSON,
+        STAGE3_SUMMARY_JSON,
         "w",
         encoding="utf-8",
     ) as fh:
 
         json.dump(
-            stage2_summary,
+            stage3_summary,
             fh,
             indent=2,
             ensure_ascii=False,
         )
 
     print(
-        STAGE2_SUMMARY_JSON
+        STAGE3_SUMMARY_JSON
     )
 
-    # --------------------------------------------------------------
-    # Rejection details
-    # --------------------------------------------------------------
+    # =========================================================================
+    # WRITE REJECTIONS
+    # =========================================================================
 
     with open(
-        STAGE2_REJECTIONS_JSON,
+        STAGE3_REJECTIONS_JSON,
         "w",
         encoding="utf-8",
     ) as fh:
 
         json.dump(
-            stage2_rejection_details,
+            stage3_rejection_details,
             fh,
             indent=2,
             ensure_ascii=False,
         )
 
     print(
-        STAGE2_REJECTIONS_JSON
+        STAGE3_REJECTIONS_JSON
     )
 
     print()
     print("=" * 70)
-    print("STAGE 2 DONE")
+    print("STAGE 3 DONE")
     print("=" * 70)
     print()
 
     print(
-        "No MIDI files were copied, moved, "
-        "or modified."
+        "No MIDI files were copied, moved, or modified."
     )
 
     print()
