@@ -69,6 +69,9 @@ import sys
 from pathlib import Path
 from collections import Counter
 from tqdm import tqdm
+import numpy as np
+from pretty_midi_fix import UglyMIDI
+import pretty_midi
 
 
 # ============================================================================
@@ -154,7 +157,32 @@ FILTERS = {
     # Text events are not a problem.
     "max_text_events": None,
 }
+# ============================================================================
+# STAGE 2 — MIDI-LEVEL MUSICAL FILTERS
+# ============================================================================
 
+STAGE2_FILTERS = {
+
+    # Quantization:
+    #
+    # The project considers:
+    #
+    #   <= 0.45       good quantization
+    #   0.45-0.65     suspicious
+    #   > 0.65        bad
+    #
+    # We keep the original project's accepted regions.
+    "quantization_good_max": 0.45,
+    "quantization_bad_min": 0.65,
+
+    # Instruments/tracks with fewer notes than this are ignored when
+    # evaluating quantization.
+    "min_notes_for_quantization": 20,
+
+    # Reject files that cannot be parsed by UglyMIDI.
+    "reject_parse_errors": True,
+
+}
 
 # ============================================================================
 # HELPERS
@@ -386,90 +414,544 @@ def get_int(meta, key, default=0):
 
 def first_track_has_notes(midi_path):
     """
-    Read one MIDI file and determine whether its first actual MIDI track
-    contains at least one note event.
+    Check whether the first actual MIDI track contains at least
+    one sounding note.
 
-    MIDI score structure:
+    This intentionally does NOT use MIDI.midi2opus().
 
-        score[0] = ticks
-        score[1] = first actual MIDI track
-        score[2] = second actual MIDI track
-        ...
+    We only need the first MTrk chunk, so we inspect the Standard
+    MIDI File container directly and never parse subsequent tracks.
 
     Returns:
-
         (True, None)
 
     or:
-
         (False, reason)
     """
 
     try:
 
-        # --------------------------------------------------------------
-        # Read MIDI
-        # --------------------------------------------------------------
+        with open(midi_path, "rb") as fh:
 
-        opus = MIDI.midi2opus(
-            str(midi_path)
-        )
+            # ----------------------------------------------------------
+            # MIDI header
+            # ----------------------------------------------------------
 
-        # --------------------------------------------------------------
-        # Basic opus sanity check
-        # --------------------------------------------------------------
+            header = fh.read(14)
 
-        if not isinstance(opus, (list, tuple)):
-            return False, "invalid_opus"
+            if len(header) < 14:
 
-        if len(opus) < 2:
-            return False, "no_midi_tracks"
+                return False, "midi_too_short"
 
-        # --------------------------------------------------------------
-        # Convert to SCORE representation.
-        #
-        # score[0] = ticks
-        # score[1] = first actual MIDI track
-        # --------------------------------------------------------------
+            if header[0:4] != b"MThd":
 
-        score = MIDI.opus2score(opus)
+                return False, "missing_mthd"
 
-        if not isinstance(score, (list, tuple)):
-            return False, "invalid_score"
+            header_length = int.from_bytes(
+                header[4:8],
+                byteorder="big"
+            )
 
-        if len(score) < 2:
-            return False, "no_midi_tracks"
+            if header_length < 6:
 
-        first_track = score[1]
+                return False, "invalid_midi_header"
 
-        if not isinstance(first_track, (list, tuple)):
-            return False, "first_track_invalid"
+            # ----------------------------------------------------------
+            # Locate first track.
+            #
+            # Normally the header length is 6, but honor the actual
+            # value in case of unusual files.
+            # ----------------------------------------------------------
 
-        # --------------------------------------------------------------
-        # Look for actual note events.
-        # --------------------------------------------------------------
+            if header_length > 6:
 
-        for event in first_track:
+                fh.seek(
+                    header_length - 6,
+                    1
+                )
 
-            if not isinstance(event, (list, tuple)):
-                continue
+            track_header = fh.read(8)
 
-            if len(event) == 0:
-                continue
+            if len(track_header) < 8:
 
-            if event[0] == "note":
-                return True, None
+                return False, "no_first_track"
 
-        return False, "first_track_has_no_notes"
+            # ----------------------------------------------------------
+            # First actual MIDI track must begin with MTrk.
+            # ----------------------------------------------------------
+
+            if track_header[0:4] != b"MTrk":
+
+                return False, "first_track_not_mtrk"
+
+            track_length = int.from_bytes(
+                track_header[4:8],
+                byteorder="big"
+            )
+
+            # ----------------------------------------------------------
+            # Read ONLY the first track.
+            # ----------------------------------------------------------
+
+            track_data = fh.read(
+                track_length
+            )
+
+            if len(track_data) != track_length:
+
+                return False, "truncated_first_track"
+
+            # ----------------------------------------------------------
+            # Parse MIDI events sufficiently to identify note_on.
+            #
+            # We do not need to understand the entire musical event
+            # structure. We only need to identify:
+            #
+            #   0x9n = note_on
+            #
+            # A note_on with velocity 0 is note_off.
+            #
+            # Running status is supported.
+            # ----------------------------------------------------------
+
+            i = 0
+            running_status = None
+
+            while i < len(track_data):
+
+                # ------------------------------------------------------
+                # Skip delta-time (variable-length quantity)
+                # ------------------------------------------------------
+
+                delta_bytes = 0
+
+                while True:
+
+                    if i >= len(track_data):
+
+                        return False, "invalid_delta_time"
+
+                    byte = track_data[i]
+                    i += 1
+
+                    delta_bytes += 1
+
+                    if byte < 0x80:
+
+                        break
+
+                    if delta_bytes > 4:
+
+                        return False, "invalid_delta_time"
+
+                if i >= len(track_data):
+
+                    break
+
+                status_or_data = track_data[i]
+
+                # ------------------------------------------------------
+                # New status byte
+                # ------------------------------------------------------
+
+                if status_or_data & 0x80:
+
+                    status = status_or_data
+                    i += 1
+
+                    # Meta event
+                    if status == 0xFF:
+
+                        if i >= len(track_data):
+
+                            return False, "truncated_meta_event"
+
+                        i += 1
+
+                        length = 0
+
+                        while True:
+
+                            if i >= len(track_data):
+
+                                return False, "truncated_meta_length"
+
+                            byte = track_data[i]
+                            i += 1
+
+                            length = (
+                                (length << 7)
+                                | (byte & 0x7F)
+                            )
+
+                            if byte < 0x80:
+
+                                break
+
+                        i += length
+
+                        if i > len(track_data):
+
+                            return False, "truncated_meta_event"
+
+                        running_status = None
+
+                        continue
+
+                    # SysEx
+                    if status in (0xF0, 0xF7):
+
+                        length = 0
+
+                        while True:
+
+                            if i >= len(track_data):
+
+                                return False, "truncated_sysex_length"
+
+                            byte = track_data[i]
+                            i += 1
+
+                            length = (
+                                (length << 7)
+                                | (byte & 0x7F)
+                            )
+
+                            if byte < 0x80:
+
+                                break
+
+                        i += length
+
+                        if i > len(track_data):
+
+                            return False, "truncated_sysex"
+
+                        running_status = None
+
+                        continue
+
+                    # Channel message
+                    running_status = status
+
+                else:
+
+                    # --------------------------------------------------
+                    # Running status
+                    # --------------------------------------------------
+
+                    if running_status is None:
+
+                        return False, "running_status_missing"
+
+                    status = running_status
+
+                # ------------------------------------------------------
+                # Channel message
+                # ------------------------------------------------------
+
+                message_type = status & 0xF0
+
+                # Note On
+                if message_type == 0x90:
+
+                    # If this was running status, status byte was not
+                    # consumed above, so current byte is still data.
+                    #
+                    # If it was a new status, current byte is first
+                    # data byte.
+                    if i >= len(track_data):
+
+                        return False, "truncated_note_on"
+
+                    note = track_data[i]
+                    i += 1
+
+                    if i >= len(track_data):
+
+                        return False, "truncated_note_on"
+
+                    velocity = track_data[i]
+                    i += 1
+
+                    # Real sounding note.
+                    if velocity != 0:
+
+                        return True, None
+
+                    continue
+
+                # ------------------------------------------------------
+                # Other channel messages
+                # ------------------------------------------------------
+
+                if message_type in (
+                    0x80,  # note off
+                    0xA0,  # polyphonic aftertouch
+                    0xB0,  # controller
+                    0xE0,  # pitch bend
+                ):
+
+                    i += 2
+
+                elif message_type in (
+                    0xC0,  # program change
+                    0xD0,  # channel pressure
+                ):
+
+                    i += 1
+
+                else:
+
+                    return False, "unknown_midi_event"
+
+                if i > len(track_data):
+
+                    return False, "truncated_midi_event"
+
+            return False, "first_track_has_no_notes"
+
+    except OSError:
+
+        return False, "file_read_error"
 
     except Exception as exc:
 
         return False, (
+            "first_track_scan_error:"
+            + type(exc).__name__
+        )
+
+# ============================================================================
+# STAGE 2 HELPERS
+# ============================================================================
+
+def get_midi_time_signature(midi_path):
+    """
+    Read the first usable MIDI time signature.
+
+    Returns:
+        (numerator, denominator)
+
+    If no time signature is present, defaults to 4/4.
+    """
+
+    try:
+
+        midi = pretty_midi.PrettyMIDI(
+            str(midi_path)
+        )
+
+        time_signatures = midi.time_signature_changes
+
+        if time_signatures:
+
+            ts = time_signatures[0]
+
+            return (
+                int(ts.numerator),
+                int(ts.denominator),
+            )
+
+    except Exception:
+
+        pass
+
+    # Conservative default.
+    return 4, 4
+
+
+def beat_div_from_time_signature(
+    numerator,
+    denominator,
+):
+    """
+    Determine the number of subdivisions per beat used by the
+    CP-transformer preprocessing grid.
+
+    Our definition of "beat" follows the actual denominator:
+
+        4/4 -> quarter-note beat -> 4 sixteenth subdivisions
+        3/4 -> quarter-note beat -> 4 sixteenth subdivisions
+
+        6/8 -> eighth-note beat  -> 2 sixteenth subdivisions
+        9/8 -> eighth-note beat  -> 2 sixteenth subdivisions
+        12/8 -> eighth-note beat -> 2 sixteenth subdivisions
+
+    This deliberately does NOT assume that every meter has a
+    quarter-note beat.
+    """
+
+    if denominator == 8:
+        return 2
+
+    if denominator == 16:
+        return 1
+
+    if denominator == 2:
+        return 8
+
+    if denominator == 1:
+        return 16
+
+    # Quarter-note denominator.
+    return 4
+
+
+def analyze_stage2_quantization(
+    midi_path,
+):
+    """
+    Analyze MIDI quantization using the project's UglyMIDI
+    representation.
+
+    Returns:
+
+        {
+            "beat_div": ...,
+            "time_signature": [numerator, denominator],
+            "quantization_score": ...,
+            "usable_instruments": ...,
+            "total_notes": ...,
+        }
+
+    or:
+
+        (None, reason)
+    """
+
+    numerator, denominator = get_midi_time_signature(
+        midi_path
+    )
+
+    beat_div = beat_div_from_time_signature(
+        numerator,
+        denominator,
+    )
+
+    try:
+
+        midi = UglyMIDI(
+            str(midi_path),
+            constant_tempo=60.0 / beat_div,
+        )
+
+    except Exception as exc:
+
+        return None, (
             "midi_parse_error:"
             + type(exc).__name__
         )
 
+    try:
 
+        midi_end_time = int(
+            midi.get_end_time()
+        )
+
+    except Exception as exc:
+
+        return None, (
+            "midi_analysis_error:"
+            + type(exc).__name__
+        )
+
+    if midi_end_time <= 0:
+
+        return None, "empty_midi"
+
+    best_statistics = 1.0
+
+    usable_instruments = 0
+    total_notes = 0
+
+    for ins in midi.instruments:
+
+        note_count = len(ins.notes)
+
+        if note_count <= STAGE2_FILTERS[
+            "min_notes_for_quantization"
+        ]:
+
+            continue
+
+        usable_instruments += 1
+        total_notes += note_count
+
+        statistics = np.zeros(
+            beat_div,
+            dtype=np.uint32,
+        )
+
+        for note in ins.notes:
+
+            start_time = int(
+                round(note.start)
+            )
+
+            statistics[
+                start_time % beat_div
+            ] += 1
+
+        # Same statistic used by the project's
+        # filter_la_quantization().
+        statistic = (
+            statistics[1::2].sum()
+            / len(ins.notes)
+        )
+
+        best_statistics = min(
+            best_statistics,
+            statistic,
+        )
+
+    # No sufficiently populated instrument.
+    if usable_instruments == 0:
+
+        return None, (
+            "no_instrument_with_enough_notes"
+        )
+
+    # Same acceptance logic as the existing
+    # preprocessing code:
+    #
+    # <= 0.45  -> likely well quantized
+    # > 0.65   -> bad
+    #
+    # The 0.45-0.65 region is intentionally rejected.
+    if not (
+        best_statistics <= STAGE2_FILTERS[
+            "quantization_good_max"
+        ]
+        or
+        (
+            best_statistics >
+            STAGE2_FILTERS[
+                "quantization_bad_min"
+            ]
+            and
+            best_statistics < 1.0
+        )
+    ):
+
+        return None, (
+            "poor_or_ambiguous_quantization"
+        )
+
+    return {
+        "beat_div": beat_div,
+        "time_signature": [
+            numerator,
+            denominator,
+        ],
+        "quantization_score":
+            float(best_statistics),
+        "usable_instruments":
+            usable_instruments,
+        "total_notes":
+            total_notes,
+    }, None
+        
 # ============================================================================
 # BUILD MIDI INDEX
 # ============================================================================
@@ -1495,6 +1977,341 @@ def main():
     print()
     print(SUMMARY_JSON1B)
     print(REJECTIONS_JSON1B)
+
+    # =========================================================================
+    # STAGE 2
+    # =========================================================================
+
+    print()
+    print("=" * 70)
+    print("STAGE 2 — MIDI-LEVEL QUANTIZATION FILTER")
+    print("=" * 70)
+    print()
+
+    stage2_candidates = []
+    stage2_rejection_counts = Counter()
+    stage2_rejection_details = []
+
+    input_candidates = len(candidates)
+
+    print(
+        f"Input Stage 1 candidates: "
+        f"{input_candidates:,}"
+    )
+
+    print()
+    print(
+        "Parsing MIDI files and analyzing quantization..."
+    )
+    print()
+
+    for candidate in tqdm(
+        candidates,
+        total=len(candidates),
+    ):
+
+        midi_path = candidate["path"]
+
+        analysis, reason = analyze_stage2_quantization(
+            midi_path
+        )
+
+        if reason is not None:
+
+            stage2_rejection_counts[
+                reason
+            ] += 1
+
+            stage2_rejection_details.append(
+                {
+                    "md5":
+                        candidate["md5"],
+
+                    "path":
+                        midi_path,
+
+                    "reason":
+                        reason,
+                }
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # Preserve Stage 1 information and append Stage 2 information.
+        # --------------------------------------------------------------
+
+        stage2_candidate = dict(
+            candidate
+        )
+
+        stage2_candidate[
+            "stage2"
+        ] = analysis
+
+        stage2_candidates.append(
+            stage2_candidate
+        )
+
+    # =========================================================================
+    # STAGE 2 REPORT
+    # =========================================================================
+
+    stage2_input_count = (
+        len(candidates)
+    )
+
+    stage2_survivor_count = (
+        len(stage2_candidates)
+    )
+
+    stage2_rejected_count = (
+        stage2_input_count
+        -
+        stage2_survivor_count
+    )
+
+    print()
+    print("=" * 70)
+    print("STAGE 2 COMPLETE")
+    print("=" * 70)
+    print()
+
+    print(
+        f"Input candidates       : "
+        f"{stage2_input_count:,}"
+    )
+
+    print(
+        f"Survivors              : "
+        f"{stage2_survivor_count:,}"
+    )
+
+    print(
+        f"Rejected               : "
+        f"{stage2_rejected_count:,}"
+    )
+
+    if stage2_input_count:
+
+        print(
+            f"Survivor ratio         : "
+            f"{stage2_survivor_count / stage2_input_count:.4f}"
+        )
+
+    print()
+
+    print(
+        "Rejection reasons:"
+    )
+
+    print("-" * 70)
+
+    for reason, count in (
+        stage2_rejection_counts
+        .most_common()
+    ):
+
+        print(
+            f"{reason:40s}"
+            f"{count:10,}"
+        )
+
+    # =========================================================================
+    # STAGE 2 OUTPUT
+    # =========================================================================
+
+    STAGE2_DIR = (
+        OUTPUT_DIR /
+        "stage2"
+    )
+
+    STAGE2_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    STAGE2_CANDIDATES_TXT = (
+        STAGE2_DIR /
+        "candidates.txt"
+    )
+
+    STAGE2_CANDIDATES_JSON = (
+        STAGE2_DIR /
+        "candidates.json"
+    )
+
+    STAGE2_SUMMARY_JSON = (
+        STAGE2_DIR /
+        "summary.json"
+    )
+
+    STAGE2_REJECTIONS_JSON = (
+        STAGE2_DIR /
+        "rejections.json"
+    )
+
+    print()
+    print("=" * 70)
+    print("Writing Stage 2 survivor manifests...")
+    print("=" * 70)
+    print()
+
+    # --------------------------------------------------------------
+    # Plain path manifest
+    # --------------------------------------------------------------
+
+    with open(
+        STAGE2_CANDIDATES_TXT,
+        "w",
+        encoding="utf-8",
+    ) as fh:
+
+        for candidate in stage2_candidates:
+
+            fh.write(
+                candidate["path"]
+                + "\n"
+            )
+
+    print(
+        STAGE2_CANDIDATES_TXT
+    )
+
+    # --------------------------------------------------------------
+    # Detailed candidate JSON
+    # --------------------------------------------------------------
+
+    with open(
+        STAGE2_CANDIDATES_JSON,
+        "w",
+        encoding="utf-8",
+    ) as fh:
+
+        json.dump(
+            {
+                "dataset":
+                    "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
+
+                "stage":
+                    "2",
+
+                "description":
+                    (
+                        "Stage 1 candidates filtered by "
+                        "actual MIDI parsing and "
+                        "time-signature-aware quantization."
+                    ),
+
+                "input_manifest":
+                    str(CANDIDATES_TXT),
+
+                "candidates":
+                    stage2_candidates,
+
+            },
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(
+        STAGE2_CANDIDATES_JSON
+    )
+
+    # --------------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------------
+
+    stage2_summary = {
+
+        "stage":
+            "2",
+
+        "description":
+            (
+                "MIDI-level quantization filtering "
+                "of Stage 1 candidates."
+            ),
+
+        "input_candidates":
+            stage2_input_count,
+
+        "survivors":
+            stage2_survivor_count,
+
+        "rejected":
+            stage2_rejected_count,
+
+        "survivor_ratio":
+            (
+                stage2_survivor_count /
+                stage2_input_count
+                if stage2_input_count
+                else 0
+            ),
+
+        "filters":
+            STAGE2_FILTERS,
+
+        "rejection_counts":
+            dict(
+                stage2_rejection_counts
+            ),
+
+    }
+
+    with open(
+        STAGE2_SUMMARY_JSON,
+        "w",
+        encoding="utf-8",
+    ) as fh:
+
+        json.dump(
+            stage2_summary,
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(
+        STAGE2_SUMMARY_JSON
+    )
+
+    # --------------------------------------------------------------
+    # Rejection details
+    # --------------------------------------------------------------
+
+    with open(
+        STAGE2_REJECTIONS_JSON,
+        "w",
+        encoding="utf-8",
+    ) as fh:
+
+        json.dump(
+            stage2_rejection_details,
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(
+        STAGE2_REJECTIONS_JSON
+    )
+
+    print()
+    print("=" * 70)
+    print("STAGE 2 DONE")
+    print("=" * 70)
+    print()
+
+    print(
+        "No MIDI files were copied, moved, "
+        "or modified."
+    )
+
+    print()
+
 
 # ============================================================================
 # ENTRY POINT
