@@ -90,6 +90,7 @@ OUTPUT_DIR = Path(
 CANDIDATES_TXT = OUTPUT_DIR / "candidates.txt"
 CANDIDATES_JSON = OUTPUT_DIR / "candidates.json"
 SUMMARY_JSON = OUTPUT_DIR / "summary.json"
+REJECTIONS_JSON = OUTPUT_DIR / "rejections.json"
 
 
 # ============================================================================
@@ -145,38 +146,209 @@ FILTERS = {
 # HELPERS
 # ============================================================================
 
-def metadata_to_dict(metadata_entries):
+# #OLD
+# def metadata_to_dict(metadata_entries):
+#     """
+#     Convert LAMDa metadata from:
+
+#         [
+#             ['total_number_of_tracks', 9],
+#             ['total_number_of_chords', 2730],
+#             ...
+#         ]
+
+#     into:
+
+#         {
+#             'total_number_of_tracks': 9,
+#             'total_number_of_chords': 2730,
+#             ...
+#         }
+#     """
+
+#     result = {}
+
+#     for entry in metadata_entries:
+
+#         if not isinstance(entry, (list, tuple)):
+#             continue
+
+#         if len(entry) < 2:
+#             continue
+
+#         result[entry[0]] = entry[1]
+
+#     return result
+
+
+# def get_int(meta, key, default=0):
+#     """Safely return an integer metadata value."""
+
+#     value = meta.get(key, default)
+
+#     try:
+#         return int(value)
+
+#     except (TypeError, ValueError):
+#         return default
+# #END OLD
+
+#NEW
+def validate_metadata_record(record):
     """
-    Convert LAMDa metadata from:
+    Validate and normalize one LAMDa metadata record.
 
-        [
-            ['total_number_of_tracks', 9],
-            ['total_number_of_chords', 2730],
-            ...
-        ]
+    Returns:
+        (md5, metadata_dict, None)
 
-    into:
+    or:
+        (md5, None, rejection_reason)
 
-        {
-            'total_number_of_tracks': 9,
-            'total_number_of_chords': 2730,
-            ...
-        }
+    Each record gets ONE metadata-related rejection reason.
     """
 
-    result = {}
+    # --------------------------------------------------------------
+    # Record shape
+    # --------------------------------------------------------------
+    if not isinstance(record, (list, tuple)) or len(record) < 2:
+        return None, None, "metadata_record_wrong_shape"
 
-    for entry in metadata_entries:
+    # --------------------------------------------------------------
+    # MD5
+    # --------------------------------------------------------------
+    md5 = record[0]
 
-        if not isinstance(entry, (list, tuple)):
-            continue
+    if not isinstance(md5, str) or not md5.strip():
+        return None, None, "metadata_record_wrong_shape"
 
-        if len(entry) < 2:
-            continue
+    md5 = md5.lower()
 
-        result[entry[0]] = entry[1]
+    # --------------------------------------------------------------
+    # Metadata list
+    # --------------------------------------------------------------
+    raw_metadata = record[1]
 
-    return result
+    if raw_metadata is None:
+        return md5, None, "metadata_list_missing"
+
+    if not isinstance(raw_metadata, (list, tuple)):
+        return md5, None, "metadata_list_missing"
+
+    # --------------------------------------------------------------
+    # Convert entries WITHOUT silently swallowing malformed entries.
+    # --------------------------------------------------------------
+    meta = {}
+
+    for entry in raw_metadata:
+
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            return md5, None, "required_field_wrong_type"
+
+        key = entry[0]
+        value = entry[1]
+
+        if not isinstance(key, str):
+            return md5, None, "required_field_wrong_type"
+
+        meta[key] = value
+
+    # --------------------------------------------------------------
+    # Required fields.
+    #
+    # These are the fields Stage 1 actually relies upon.
+    # --------------------------------------------------------------
+    required_fields = [
+        "total_number_of_tracks",
+        "total_number_of_score_midi_events",
+        "total_number_of_chords",
+        "total_number_of_chords_ms",
+        "pitches_times_sum_ms",
+    ]
+
+    for field in required_fields:
+
+        if field not in meta:
+            return md5, None, "required_field_absent"
+
+    # --------------------------------------------------------------
+    # Numeric fields
+    # --------------------------------------------------------------
+    numeric_fields = [
+        "total_number_of_tracks",
+        "total_number_of_score_midi_events",
+        "total_number_of_chords",
+        "total_number_of_chords_ms",
+        "pitches_times_sum_ms",
+        "tempo_change_count",
+        "text_events_count",
+        "lyric_events_count",
+    ]
+
+    for field in numeric_fields:
+
+        if field not in meta:
+            # Optional numeric fields are allowed to be absent.
+            if field in (
+                "tempo_change_count",
+                "text_events_count",
+                "lyric_events_count",
+            ):
+                continue
+
+            return md5, None, "required_field_absent"
+
+        try:
+            int(meta[field])
+
+        except (TypeError, ValueError):
+            return md5, None, "numeric_field_invalid"
+
+    # --------------------------------------------------------------
+    # midi_patches
+    # --------------------------------------------------------------
+    if "midi_patches" not in meta:
+        return md5, None, "midi_patches_missing_or_malformed"
+
+    if not isinstance(meta["midi_patches"], (list, tuple)):
+        return md5, None, "midi_patches_missing_or_malformed"
+
+    # --------------------------------------------------------------
+    # Explicit validation of total_number_of_tracks
+    # --------------------------------------------------------------
+    try:
+        tracks = int(meta["total_number_of_tracks"])
+
+        if tracks < 0:
+            return md5, None, "total_number_of_tracks_invalid"
+
+    except (TypeError, ValueError):
+        return md5, None, "total_number_of_tracks_invalid"
+
+    # --------------------------------------------------------------
+    # Explicit validation of total_number_of_chords
+    # --------------------------------------------------------------
+    try:
+        chords = int(meta["total_number_of_chords"])
+
+        if chords < 0:
+            return md5, None, "total_number_of_chords_invalid"
+
+    except (TypeError, ValueError):
+        return md5, None, "total_number_of_chords_invalid"
+
+    # --------------------------------------------------------------
+    # Explicit validation of total_number_of_chords_ms
+    # --------------------------------------------------------------
+    try:
+        chords_ms = int(meta["total_number_of_chords_ms"])
+
+        if chords_ms < 0:
+            return md5, None, "total_number_of_chords_ms_invalid"
+
+    except (TypeError, ValueError):
+        return md5, None, "total_number_of_chords_ms_invalid"
+
+    return md5, meta, None
 
 
 def get_int(meta, key, default=0):
@@ -189,7 +361,7 @@ def get_int(meta, key, default=0):
 
     except (TypeError, ValueError):
         return default
-
+#END NEW
 
 # ============================================================================
 # BUILD MIDI INDEX
@@ -479,7 +651,40 @@ def main():
     rejection_counts = Counter()
 
     missing_midi = 0
-    malformed_metadata = 0
+
+    # #OLD
+    # malformed_metadata = 0
+
+    # for record in meta_data:
+
+    #     # --------------------------------------------------------------
+    #     # Validate metadata record
+    #     # --------------------------------------------------------------
+
+    #     try:
+
+    #         md5 = str(
+    #             record[0]
+    #         ).lower()
+
+    #         raw_metadata = record[1]
+
+    #         meta = metadata_to_dict(
+    #             raw_metadata
+    #         )
+
+    #     except Exception:
+
+    #         malformed_metadata += 1
+
+    #         rejection_counts[
+    #             "malformed_metadata"
+    #         ] += 1
+
+    #         continue
+    # #END OLD
+    #NEW
+    rejection_details = []
 
     for record in meta_data:
 
@@ -487,27 +692,25 @@ def main():
         # Validate metadata record
         # --------------------------------------------------------------
 
-        try:
+        md5, meta, metadata_reason = validate_metadata_record(
+            record
+        )
 
-            md5 = str(
-                record[0]
-            ).lower()
-
-            raw_metadata = record[1]
-
-            meta = metadata_to_dict(
-                raw_metadata
-            )
-
-        except Exception:
-
-            malformed_metadata += 1
+        if metadata_reason is not None:
 
             rejection_counts[
-                "malformed_metadata"
+                metadata_reason
             ] += 1
 
+            rejection_details.append(
+                {
+                    "md5": md5,
+                    "reason": metadata_reason,
+                }
+            )
+
             continue
+        #END NEW
 
         # --------------------------------------------------------------
         # Locate physical MIDI
@@ -515,6 +718,18 @@ def main():
 
         midi_path = midi_index.get(md5)
 
+        # #OLD
+        # if midi_path is None:
+
+        #     missing_midi += 1
+
+        #     rejection_counts[
+        #         "missing_midi"
+        #     ] += 1
+
+        #     continue
+        # #END OLD
+        #NEW
         if midi_path is None:
 
             missing_midi += 1
@@ -523,7 +738,15 @@ def main():
                 "missing_midi"
             ] += 1
 
+            rejection_details.append(
+                {
+                    "md5": md5,
+                    "reason": "missing_midi",
+                }
+            )
+
             continue
+        #END NEW
 
         # --------------------------------------------------------------
         # Apply structural filters
@@ -531,13 +754,32 @@ def main():
 
         passed, reason = passes_stage1(meta)
 
+        # #OLD
+        # if not passed:
+
+        #     rejection_counts[
+        #         reason
+        #     ] += 1
+
+        #     continue
+        # #END OLD.
+        #NEW
         if not passed:
 
             rejection_counts[
                 reason
             ] += 1
 
+            rejection_details.append(
+                {
+                    "md5": md5,
+                    "path": midi_path,
+                    "reason": reason,
+                }
+            )
+
             continue
+        #END NEW
 
         # --------------------------------------------------------------
         # Preserve useful metadata.
@@ -656,7 +898,27 @@ def main():
     print(f"Candidates             : {candidate_count:,}")
     print(f"Rejected               : {rejected_count:,}")
     print(f"Missing MIDI           : {missing_midi:,}")
-    print(f"Malformed metadata     : {malformed_metadata:,}")
+    # print(f"Malformed metadata     : {malformed_metadata:,}")
+    metadata_rejection_total = sum(
+        count
+        for reason, count in rejection_counts.items()
+        if reason in {
+            "metadata_record_wrong_shape",
+            "metadata_list_missing",
+            "required_field_absent",
+            "required_field_wrong_type",
+            "numeric_field_invalid",
+            "midi_patches_missing_or_malformed",
+            "total_number_of_tracks_invalid",
+            "total_number_of_chords_invalid",
+            "total_number_of_chords_ms_invalid",
+        }
+    )
+
+    print(
+        f"Metadata validation rejects : "
+        f"{metadata_rejection_total:,}"
+    )
 
     if total_records > 0:
 
@@ -783,8 +1045,26 @@ def main():
         "missing_midi":
             missing_midi,
 
-        "malformed_metadata":
-            malformed_metadata,
+        # #OLD
+        # "malformed_metadata":
+        #     malformed_metadata,
+        #NEW
+        "metadata_validation_rejects":
+            {
+                reason: rejection_counts[reason]
+                for reason in (
+                    "metadata_record_wrong_shape",
+                    "metadata_list_missing",
+                    "required_field_absent",
+                    "required_field_wrong_type",
+                    "numeric_field_invalid",
+                    "midi_patches_missing_or_malformed",
+                    "total_number_of_tracks_invalid",
+                    "total_number_of_chords_invalid",
+                    "total_number_of_chords_ms_invalid",
+                )
+                if rejection_counts[reason] > 0
+            },
 
         "candidate_ratio":
             (
@@ -809,6 +1089,9 @@ def main():
 
                 "summary":
                     str(SUMMARY_JSON),
+
+                "rejections":
+                    str(REJECTIONS_JSON),
             },
     }
 
@@ -827,6 +1110,52 @@ def main():
 
     print()
     print(SUMMARY_JSON)
+
+    # =========================================================================
+    # WRITE rejection details
+    # =========================================================================
+
+    print()
+    print("=" * 70)
+    print("Writing rejection details...")
+    print("=" * 70)
+
+    with open(
+        REJECTIONS_JSON,
+        "w",
+        encoding="utf-8"
+    ) as fh:
+
+        json.dump(
+            {
+                "dataset":
+                    "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
+
+                "stage":
+                    1,
+
+                "description":
+                    (
+                        "Every MIDI rejected by Stage 1, with its "
+                        "primary rejection reason."
+                    ),
+
+                "rejection_count":
+                    len(rejection_details),
+
+                "rejections":
+                    rejection_details,
+            },
+
+            fh,
+
+            indent=2,
+
+            ensure_ascii=False,
+        )
+
+    print()
+    print(REJECTIONS_JSON)
 
     # =========================================================================
     # FINAL
