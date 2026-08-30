@@ -68,6 +68,8 @@ import pickle
 import sys
 from pathlib import Path
 from collections import Counter
+from tqdm import tqdm
+
 
 # ============================================================================
 # PATHS
@@ -90,7 +92,20 @@ CANDIDATES_TXT = OUTPUT_DIR / "candidates.txt"
 CANDIDATES_JSON = OUTPUT_DIR / "candidates.json"
 SUMMARY_JSON = OUTPUT_DIR / "summary.json"
 REJECTIONS_JSON = OUTPUT_DIR / "rejections.json"
+#+++
+INPUT_MANIFEST = Path(
+    "Dataset/LAMDselection/selection_stage1/candidates.txt"
+)
 
+OUTPUT_DIR1B = Path(
+    "Dataset/LAMDselection/selection_stage1b"
+)
+
+SURVIVORS_TXT1B = OUTPUT_DIR1B / "candidates_track0_notes.txt"
+SUMMARY_JSON1B = OUTPUT_DIR1B / "summary.json"
+REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
+
+import MIDI
 
 # ============================================================================
 # STAGE 1 FILTERS
@@ -113,7 +128,7 @@ FILTERS = {
     "min_tracks": 2,
 
     # Avoid pathological multi-track files.
-    "max_tracks": 32,
+    "max_tracks": 16,
 
     # Reject almost-empty MIDI files.
     "min_score_events": 100,
@@ -125,7 +140,7 @@ FILTERS = {
     "min_chords": 20,
 
     # At least some meaningful chord activity.
-    "min_chords_ms": 5000,
+    "min_chords_ms": 2000,
 
     # At least some meaningful pitched activity.
     "min_pitches_ms": 10000,
@@ -364,6 +379,96 @@ def get_int(meta, key, default=0):
 
     except (TypeError, ValueError):
         return default
+
+# ============================================================================
+# HELPER STAGE 1B
+# ============================================================================
+
+def first_track_has_notes(midi_path):
+    """
+    Read one MIDI file and determine whether its first actual MIDI track
+    contains at least one note event.
+
+    MIDI score structure:
+
+        score[0] = ticks
+        score[1] = first actual MIDI track
+        score[2] = second actual MIDI track
+        ...
+
+    Returns:
+
+        (True, None)
+
+    or:
+
+        (False, reason)
+    """
+
+    try:
+
+        # --------------------------------------------------------------
+        # Read MIDI
+        # --------------------------------------------------------------
+
+        opus = MIDI.midi2opus(
+            str(midi_path)
+        )
+
+        # --------------------------------------------------------------
+        # Basic opus sanity check
+        # --------------------------------------------------------------
+
+        if not isinstance(opus, (list, tuple)):
+            return False, "invalid_opus"
+
+        if len(opus) < 2:
+            return False, "no_midi_tracks"
+
+        # --------------------------------------------------------------
+        # Convert to SCORE representation.
+        #
+        # score[0] = ticks
+        # score[1] = first actual MIDI track
+        # --------------------------------------------------------------
+
+        score = MIDI.opus2score(opus)
+
+        if not isinstance(score, (list, tuple)):
+            return False, "invalid_score"
+
+        if len(score) < 2:
+            return False, "no_midi_tracks"
+
+        first_track = score[1]
+
+        if not isinstance(first_track, (list, tuple)):
+            return False, "first_track_invalid"
+
+        # --------------------------------------------------------------
+        # Look for actual note events.
+        # --------------------------------------------------------------
+
+        for event in first_track:
+
+            if not isinstance(event, (list, tuple)):
+                continue
+
+            if len(event) == 0:
+                continue
+
+            if event[0] == "note":
+                return True, None
+
+        return False, "first_track_has_no_notes"
+
+    except Exception as exc:
+
+        return False, (
+            "midi_parse_error:"
+            + type(exc).__name__
+        )
+
 
 # ============================================================================
 # BUILD MIDI INDEX
