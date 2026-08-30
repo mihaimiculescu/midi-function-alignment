@@ -71,7 +71,7 @@ from collections import Counter
 from tqdm import tqdm
 import numpy as np
 from pretty_midi_fix import UglyMIDI
-import pretty_midi
+# import pretty_midi
 
 
 # ============================================================================
@@ -728,37 +728,108 @@ def first_track_has_notes(midi_path):
 
 def get_midi_time_signature(midi_path):
     """
-    Read the first usable MIDI time signature.
+    Read the first MIDI time-signature event directly through
+    the project's MIDI.py parser.
+
+    MIDI.py represents a time-signature event as:
+
+        ['time_signature',
+         delta_time,
+         numerator,
+         denominator,
+         clocks_per_click,
+         notated_32nd_notes_per_beat]
 
     Returns:
-        (numerator, denominator)
 
-    If no time signature is present, defaults to 4/4.
+        ((numerator, denominator), None)
+
+    or:
+
+        (None, reason)
+
+    If the MIDI contains no time-signature event, 4/4 is used.
+
+    PrettyMIDI is deliberately NOT used here.
     """
 
     try:
 
-        midi = pretty_midi.PrettyMIDI(
-            str(midi_path)
+        with open(
+            midi_path,
+            "rb"
+        ) as fh:
+
+            midi_data = fh.read()
+
+        opus = MIDI.midi2opus(
+            midi_data
         )
 
-        time_signatures = midi.time_signature_changes
+    except Exception as exc:
 
-        if time_signatures:
+        return None, (
+            "time_signature_parse_error:"
+            + type(exc).__name__
+        )
 
-            ts = time_signatures[0]
+    if not opus or len(opus) < 2:
+
+        return (4, 4), None
+
+    # Search ALL tracks.
+    #
+    # This is important for Type 1 MIDI files because the
+    # time-signature event is not required to be on track 0.
+
+    for track in opus[1:]:
+
+        for event in track:
+
+            if not event:
+                continue
+
+            if event[0] != "time_signature":
+                continue
+
+            try:
+
+                numerator = int(
+                    event[2]
+                )
+
+                denominator = int(
+                    event[3]
+                )
+
+            except (
+                TypeError,
+                ValueError,
+                IndexError
+            ):
+
+                return None, (
+                    "invalid_time_signature_event"
+                )
+
+            if (
+                numerator <= 0
+                or denominator <= 0
+            ):
+
+                return None, (
+                    "invalid_time_signature_event"
+                )
 
             return (
-                int(ts.numerator),
-                int(ts.denominator),
-            )
+                numerator,
+                denominator
+            ), None
 
-    except Exception:
+    # No explicit time signature.
+    # MIDI default = 4/4.
 
-        pass
-
-    # Conservative default.
-    return 4, 4
+    return (4, 4), None
 
 
 def beat_div_from_time_signature(
@@ -820,9 +891,15 @@ def analyze_stage2_quantization(
         (None, reason)
     """
 
-    numerator, denominator = get_midi_time_signature(
+    time_signature, reason = get_midi_time_signature(
         midi_path
     )
+
+    if reason is not None:
+
+        return None, reason
+
+    numerator, denominator = time_signature    
 
     beat_div = beat_div_from_time_signature(
         numerator,
