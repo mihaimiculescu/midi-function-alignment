@@ -1233,7 +1233,268 @@ def main():
     )
 
     print()
+#STAGE1B
+    # =========================================================================
+    # STAGE 1B — FIRST TRACK NOTE FILTER
+    # =========================================================================
 
+    print()
+    print("=" * 70)
+    print("STAGE 1B — FIRST TRACK NOTE FILTER")
+    print("=" * 70)
+    print()
+
+    # ------------------------------------------------------------------
+    # Stage 1 output becomes Stage 1B input
+    # ------------------------------------------------------------------
+
+    INPUT_MANIFEST = OUTPUT_DIR / "candidates.txt"
+
+    OUTPUT_DIR1B = OUTPUT_DIR / "stage1b"
+
+    SURVIVORS_TXT1B = OUTPUT_DIR1B / "candidates.txt"
+    SUMMARY_JSON1B = OUTPUT_DIR1B / "summary.json"
+    REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
+
+    OUTPUT_DIR1B.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # ------------------------------------------------------------------
+    # Load Stage 1 candidates
+    # ------------------------------------------------------------------
+
+    print("=" * 70)
+    print("Loading Stage 1 candidate manifest...")
+    print("=" * 70)
+    print()
+
+    with open(
+        INPUT_MANIFEST,
+        "r",
+        encoding="utf-8"
+    ) as fh:
+
+        midi_paths = [
+            line.strip()
+            for line in fh
+            if line.strip()
+        ]
+
+    print(
+        f"Input candidates: {len(midi_paths):,}"
+    )
+    print()
+
+    # ------------------------------------------------------------------
+    # Process first MIDI track
+    # ------------------------------------------------------------------
+
+    survivors = []
+    rejection_counts = Counter()
+    rejection_details = []
+
+    print("=" * 70)
+    print("Scanning first MIDI track...")
+    print("=" * 70)
+    print()
+
+    for midi_path_string in tqdm(midi_paths):
+
+        midi_path = Path(midi_path_string)
+
+        # --------------------------------------------------------------
+        # Check that the path still exists
+        # --------------------------------------------------------------
+
+        if not midi_path.exists():
+
+            reason = "missing_midi"
+
+            rejection_counts[reason] += 1
+
+            rejection_details.append(
+                {
+                    "path": midi_path_string,
+                    "reason": reason,
+                }
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # Inspect first actual MIDI track
+        # --------------------------------------------------------------
+
+        passed, reason = first_track_has_notes(
+            midi_path
+        )
+
+        if not passed:
+
+            rejection_counts[reason] += 1
+
+            rejection_details.append(
+                {
+                    "path": midi_path_string,
+                    "reason": reason,
+                }
+            )
+
+            continue
+
+        # --------------------------------------------------------------
+        # SURVIVED
+        # --------------------------------------------------------------
+
+        survivors.append(
+            midi_path_string
+        )
+
+    # =========================================================================
+    # STAGE 1B REPORT
+    # =========================================================================
+
+    input_count = len(midi_paths)
+    survivor_count = len(survivors)
+    rejected_count = input_count - survivor_count
+
+    print()
+    print("=" * 70)
+    print("STAGE 1B COMPLETE")
+    print("=" * 70)
+    print()
+
+    print(
+        f"Input candidates       : {input_count:,}"
+    )
+
+    print(
+        f"Survivors              : {survivor_count:,}"
+    )
+
+    print(
+        f"Rejected               : {rejected_count:,}"
+    )
+
+    if input_count:
+
+        print(
+            f"Survivor ratio         : "
+            f"{survivor_count / input_count:.4f}"
+        )
+
+    print()
+
+    print("Rejection reasons:")
+    print("-" * 70)
+
+    for reason, count in rejection_counts.most_common():
+
+        print(
+            f"{reason:35s} {count:10,}"
+        )
+
+    # =========================================================================
+    # WRITE STAGE 1B SURVIVOR MANIFEST
+    # =========================================================================
+
+    print()
+    print("=" * 70)
+    print("Writing Stage 1B survivor manifest...")
+    print("=" * 70)
+    print()
+
+    with open(
+        SURVIVORS_TXT1B,
+        "w",
+        encoding="utf-8"
+    ) as fh:
+
+        for path in survivors:
+
+            fh.write(
+                path
+                + "\n"
+            )
+
+    print(SURVIVORS_TXT1B)
+
+    # =========================================================================
+    # WRITE STAGE 1B SUMMARY
+    # =========================================================================
+
+    summary_1b = {
+
+        "stage":
+            "1B",
+
+        "description":
+            (
+                "Keeps Stage 1 candidates whose first actual "
+                "MIDI track contains at least one note event."
+            ),
+
+        "input_manifest":
+            str(INPUT_MANIFEST),
+
+        "output_manifest":
+            str(SURVIVORS_TXT1B),
+
+        "input_candidates":
+            input_count,
+
+        "survivors":
+            survivor_count,
+
+        "rejected":
+            rejected_count,
+
+        "survivor_ratio":
+            (
+                survivor_count / input_count
+                if input_count
+                else 0
+            ),
+
+        "rejection_counts":
+            dict(rejection_counts),
+    }
+
+    with open(
+        SUMMARY_JSON1B,
+        "w",
+        encoding="utf-8"
+    ) as fh:
+
+        json.dump(
+            summary_1b,
+            fh,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    # =========================================================================
+    # WRITE STAGE 1B REJECTION DETAILS
+    # =========================================================================
+
+    with open(
+        REJECTIONS_JSON1B,
+        "w",
+        encoding="utf-8"
+    ) as fh:
+
+        json.dump(
+            rejection_details,
+            fh,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    print()
+    print(SUMMARY_JSON1B)
+    print(REJECTIONS_JSON1B)
 
 # ============================================================================
 # ENTRY POINT
