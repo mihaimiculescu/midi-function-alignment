@@ -195,6 +195,23 @@ STAGE2_CANDIDATES_TXT = (
     / "candidates.txt"
 )
 
+STAGE2_CANDIDATES_JSON = (
+    OUTPUT_DIR
+    / "stage2"
+    / "candidates.json"
+)
+
+STAGE2_SUMMARY_JSON = (
+    OUTPUT_DIR
+    / "stage2"
+    / "summary.json"
+)
+STAGE2_REJECTIONS_JSON = (
+    OUTPUT_DIR
+    / "stage2"
+    / "rejections.json"
+)
+
 
 def load_manifest(path):
     """
@@ -214,33 +231,18 @@ def load_manifest(path):
 
 
 def stage2_is_complete():
-    """
-    Stage 2 is considered complete if its survivor manifest exists
-    and contains at least one MIDI path.
-    """
 
-    if not STAGE2_CANDIDATES_TXT.exists():
-        return False
+    required_files = [
+        STAGE2_CANDIDATES_TXT,
+        STAGE2_CANDIDATES_JSON,
+        STAGE2_SUMMARY_JSON,
+        STAGE2_REJECTIONS_JSON,
+    ]
 
-    try:
-
-        with open(
-            STAGE2_CANDIDATES_TXT,
-            "r",
-            encoding="utf-8"
-        ) as fh:
-
-            for line in fh:
-
-                if line.strip():
-
-                    return True
-
-    except OSError:
-
-        return False
-
-    return False
+    return all(
+        path.is_file()
+        for path in required_files
+    )
 
 # ============================================================================
 # STAGE 3 — MIDI MUSICAL STRUCTURE ANALYSIS
