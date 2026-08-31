@@ -2836,6 +2836,15 @@ def main():
             f"{len(stage2_survivors):,}"
         )
 
+        with open(
+            STAGE2_CANDIDATES_JSON,
+            "r",
+            encoding="utf-8"
+        ) as fh:
+
+            stage2_candidates = json.load(fh)["candidates"]
+
+
         print()
 
         print(
