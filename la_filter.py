@@ -1960,14 +1960,26 @@ def write_stage3_checkpoint(
     rejection_counts,
     rejection_details,
     completed_count,
+    input_count,
+    last_md5,
 ):
     """
     Atomically save Stage 3 progress.
+
+    The checkpoint records both the number of completed files and
+    the MD5 of the last completed candidate, allowing the next run
+    to verify that the Stage 2 candidate ordering has not changed.
     """
 
     checkpoint = {
         "completed_count":
             completed_count,
+
+        "input_count":
+            input_count,
+
+        "last_md5":
+            last_md5,
 
         "reports":
             reports,
@@ -1991,7 +2003,6 @@ def write_stage3_checkpoint(
         exist_ok=True
     )
 
-    # Write temporary file first.
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -2012,7 +2023,6 @@ def write_stage3_checkpoint(
             fh.name
         )
 
-    # Atomic replacement.
     os.replace(
         temp_path,
         checkpoint_path
@@ -3496,181 +3506,211 @@ def main():
     )
     print()
 
-#BYE
-stage3_reports = []
-stage3_survivors = []
-stage3_rejection_counts = Counter()
-stage3_rejection_details = []
+    stage3_reports = []
+    stage3_survivors = []
+    stage3_rejection_counts = Counter()
+    stage3_rejection_details = []
 
-# =========================================================================
-# STAGE 3 CHECKPOINT
-# =========================================================================
+    # =========================================================================
+    # STAGE 3 CHECKPOINT
+    # =========================================================================
 
-STAGE3_CHECKPOINT = (
-    STAGE3_DIR /
-    "checkpoint.json"
-)
+    STAGE3_CHECKPOINT = (
+        STAGE3_DIR /
+        "checkpoint.json"
+    )
 
-checkpoint = load_stage3_checkpoint(
-    STAGE3_CHECKPOINT
-)
+    checkpoint = load_stage3_checkpoint(
+        STAGE3_CHECKPOINT
+    )
 
-if checkpoint is not None:
+
+    if checkpoint is not None:
+
+        print()
+        print("=" * 70)
+        print("STAGE 3 CHECKPOINT FOUND")
+        print("=" * 70)
+        print()
+
+        completed_count = int(
+            checkpoint.get(
+                "completed_count",
+                0
+            )
+        )
+
+        checkpoint_input_count = int(
+            checkpoint.get(
+                "input_count",
+                -1
+            )
+        )
+
+        checkpoint_last_md5 = (
+            checkpoint.get(
+                "last_md5"
+            )
+        )
+
+        current_input_count = len(
+            stage2_candidates
+        )
+
+        # --------------------------------------------------------------
+        # Validate that the checkpoint belongs to this exact Stage 2
+        # candidate list.
+        # --------------------------------------------------------------
+
+        if checkpoint_input_count != current_input_count:
+
+            raise RuntimeError(
+                "Stage 3 checkpoint is incompatible with the "
+                "current Stage 2 candidate list:\n"
+                f"  checkpoint input count: "
+                f"{checkpoint_input_count:,}\n"
+                f"  current input count:    "
+                f"{current_input_count:,}\n"
+                "\n"
+                "The Stage 2 candidate list has changed. "
+                "Delete checkpoint.json and restart Stage 3."
+            )
+
+        # --------------------------------------------------------------
+        # Verify the last processed MD5.
+        # --------------------------------------------------------------
+
+        if completed_count > 0:
+
+            if completed_count > current_input_count:
+
+                raise RuntimeError(
+                    "Stage 3 checkpoint claims more completed "
+                    "files than exist in the current Stage 2 list."
+                )
+
+            expected_md5 = stage2_candidates[
+                completed_count - 1
+            ]["md5"]
+
+            if checkpoint_last_md5 != expected_md5:
+
+                raise RuntimeError(
+                    "Stage 3 checkpoint ordering mismatch.\n"
+                    f"  checkpoint last MD5: "
+                    f"{checkpoint_last_md5}\n"
+                    f"  current expected MD5: "
+                    f"{expected_md5}\n"
+                    "\n"
+                    "The Stage 2 candidate ordering has changed. "
+                    "Delete checkpoint.json and restart Stage 3."
+                )
+
+        stage3_reports = (
+            checkpoint.get(
+                "reports",
+                []
+            )
+        )
+
+        stage3_survivors = (
+            checkpoint.get(
+                "survivors",
+                []
+            )
+        )
+
+        stage3_rejection_counts = Counter(
+            checkpoint.get(
+                "rejection_counts",
+                {}
+            )
+        )
+
+        stage3_rejection_details = (
+            checkpoint.get(
+                "rejection_details",
+                []
+            )
+        )
+
+        print(
+            f"Checkpoint contains: "
+            f"{completed_count:,} completed files"
+        )
+
+        print(
+            f"Checkpoint ordering verified."
+        )
+
+    else:
+
+        completed_count = 0
+
+    # =========================================================================
+    # DETERMINE REMAINING WORK
+    # =========================================================================
+
+    remaining_candidates = (
+        stage2_candidates[
+            completed_count:
+        ]
+    )
 
     print()
-    print("=" * 70)
-    print("STAGE 3 CHECKPOINT FOUND")
-    print("=" * 70)
-    print()
-
-    completed_count = int(
-        checkpoint.get(
-            "completed_count",
-            0
-        )
-    )
-
-    stage3_reports = (
-        checkpoint.get(
-            "reports",
-            []
-        )
-    )
-
-    stage3_survivors = (
-        checkpoint.get(
-            "survivors",
-            []
-        )
-    )
-
-    stage3_rejection_counts = Counter(
-        checkpoint.get(
-            "rejection_counts",
-            {}
-        )
-    )
-
-    stage3_rejection_details = (
-        checkpoint.get(
-            "rejection_details",
-            []
-        )
+    print(
+        f"Stage 3 workers       : "
+        f"{STAGE3_WORKERS}"
     )
 
     print(
-        f"Checkpoint contains: "
-        f"{completed_count:,} completed files"
+        f"Checkpoint interval   : "
+        f"{STAGE3_CHECKPOINT_INTERVAL:,}"
     )
 
-else:
-
-    completed_count = 0
-
-# =========================================================================
-# DETERMINE REMAINING WORK
-# =========================================================================
-
-remaining_candidates = (
-    stage2_candidates[
-        completed_count:
-    ]
-)
-
-print()
-print(
-    f"Stage 3 workers       : "
-    f"{STAGE3_WORKERS}"
-)
-
-print(
-    f"Checkpoint interval   : "
-    f"{STAGE3_CHECKPOINT_INTERVAL:,}"
-)
-
-print(
-    f"Already completed     : "
-    f"{completed_count:,}"
-)
-
-print(
-    f"Remaining files       : "
-    f"{len(remaining_candidates):,}"
-)
-
-print()
-
-# =========================================================================
-# PARALLEL STAGE 3
-# =========================================================================
-
-with ProcessPoolExecutor(
-    max_workers=STAGE3_WORKERS
-) as executor:
-
-    results = executor.map(
-        stage3_worker,
-        remaining_candidates,
-        chunksize=1,
+    print(
+        f"Already completed     : "
+        f"{completed_count:,}"
     )
 
-    for result in tqdm(
-        results,
-        total=len(remaining_candidates),
-        initial=0,
-    ):
+    print(
+        f"Remaining files       : "
+        f"{len(remaining_candidates):,}"
+    )
 
-        candidate = result["candidate"]
-        analysis = result["analysis"]
-        reason = result["reason"]
+    print()
 
-        completed_count += 1
+    # =========================================================================
+    # PARALLEL STAGE 3
+    # =========================================================================
 
-        if reason is not None:
+    with ProcessPoolExecutor(
+        max_workers=STAGE3_WORKERS
+    ) as executor:
 
-            stage3_rejection_counts[
-                reason
-            ] += 1
+        results = executor.map(
+            stage3_worker,
+            remaining_candidates,
+            chunksize=1,
+        )
 
-            stage3_rejection_details.append(
-                {
-                    "md5":
-                        candidate["md5"],
+        for result in tqdm(
+            results,
+            total=len(remaining_candidates),
+            initial=0,
+        ):
 
-                    "path":
-                        candidate["path"],
+            candidate = result["candidate"]
+            analysis = result["analysis"]
+            reason = result["reason"]
 
-                    "reason":
-                        reason,
-                }
-            )
+            completed_count += 1
+            last_md5 = candidate["md5"]
 
-        else:
-
-            stage3_candidate = dict(
-                candidate
-            )
-
-            stage3_candidate[
-                "stage3"
-            ] = analysis
-
-            stage3_reports.append(
-                stage3_candidate
-            )
-
-            if analysis[
-                "candidate_count"
-            ] > 0:
-
-                stage3_survivors.append(
-                    stage3_candidate
-                )
-
-            else:
+            if reason is not None:
 
                 stage3_rejection_counts[
-                    "no_non_percussion_candidate"
+                    reason
                 ] += 1
 
                 stage3_rejection_details.append(
@@ -3682,28 +3722,71 @@ with ProcessPoolExecutor(
                             candidate["path"],
 
                         "reason":
-                            "no_non_percussion_candidate",
+                            reason,
                     }
                 )
 
-        # --------------------------------------------------------------
-        # CHECKPOINT
-        # --------------------------------------------------------------
+            else:
 
-        if (
-            completed_count
-            % STAGE3_CHECKPOINT_INTERVAL
-            == 0
-        ):
+                stage3_candidate = dict(
+                    candidate
+                )
 
-            write_stage3_checkpoint(
-                STAGE3_CHECKPOINT,
-                stage3_reports,
-                stage3_survivors,
-                stage3_rejection_counts,
-                stage3_rejection_details,
-                completed_count,
-            )
+                stage3_candidate[
+                    "stage3"
+                ] = analysis
+
+                stage3_reports.append(
+                    stage3_candidate
+                )
+
+                if analysis[
+                    "candidate_count"
+                ] > 0:
+
+                    stage3_survivors.append(
+                        stage3_candidate
+                    )
+
+                else:
+
+                    stage3_rejection_counts[
+                        "no_non_percussion_candidate"
+                    ] += 1
+
+                    stage3_rejection_details.append(
+                        {
+                            "md5":
+                                candidate["md5"],
+
+                            "path":
+                                candidate["path"],
+
+                            "reason":
+                                "no_non_percussion_candidate",
+                        }
+                    )
+
+            # --------------------------------------------------------------
+            # CHECKPOINT
+            # --------------------------------------------------------------
+
+            if (
+                completed_count
+                % STAGE3_CHECKPOINT_INTERVAL
+                == 0
+            ):
+
+                write_stage3_checkpoint(
+                    STAGE3_CHECKPOINT,
+                    stage3_reports,
+                    stage3_survivors,
+                    stage3_rejection_counts,
+                    stage3_rejection_details,
+                    completed_count,
+                    len(stage2_candidates),
+                    last_md5,
+                )
 
 
     # =========================================================================
