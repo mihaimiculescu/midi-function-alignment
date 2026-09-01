@@ -3651,108 +3651,105 @@ def main():
     # =========================================================================
     # DETERMINE REMAINING WORK
     # =========================================================================
+# #BYE
+#     remaining_candidates = (
+#         stage2_candidates[
+#             completed_count:
+#         ]
+#     )
 
-    remaining_candidates = (
-        stage2_candidates[
-            completed_count:
-        ]
-    )
+#     print()
+#     print(
+#         f"Stage 3 workers       : "
+#         f"{STAGE3_WORKERS}"
+#     )
 
-    print()
-    print(
-        f"Stage 3 workers       : "
-        f"{STAGE3_WORKERS}"
-    )
+#     print(
+#         f"Checkpoint interval   : "
+#         f"{STAGE3_CHECKPOINT_INTERVAL:,}"
+#     )
 
-    print(
-        f"Checkpoint interval   : "
-        f"{STAGE3_CHECKPOINT_INTERVAL:,}"
-    )
+#     print(
+#         f"Already completed     : "
+#         f"{completed_count:,}"
+#     )
 
-    print(
-        f"Already completed     : "
-        f"{completed_count:,}"
-    )
+#     print(
+#         f"Remaining files       : "
+#         f"{len(remaining_candidates):,}"
+#     )
 
-    print(
-        f"Remaining files       : "
-        f"{len(remaining_candidates):,}"
-    )
+#     print()
 
-    print()
+#     # =========================================================================
+#     # PARALLEL STAGE 3
+#     # =========================================================================
 
-    # =========================================================================
-    # PARALLEL STAGE 3
-    # =========================================================================
-
-    with ProcessPoolExecutor(
-        max_workers=STAGE3_WORKERS,
-    ) as executor:
+#     with ProcessPoolExecutor(
+#         max_workers=STAGE3_WORKERS,
+#     ) as executor:
         
-        results = executor.map(
-            stage3_worker,
-            remaining_candidates,
-            chunksize=1,
+#         results = executor.map(
+#             stage3_worker,
+#             remaining_candidates,
+#             chunksize=1,
+#         )
+#NEW
+    remaining_candidates = stage2_candidates[completed_count:]
+
+    for batch_start in range(
+        0,
+        len(remaining_candidates),
+        STAGE3_BATCH_SIZE,
+    ):
+
+        batch = remaining_candidates[
+            batch_start:
+            batch_start + STAGE3_BATCH_SIZE
+        ]
+
+        print()
+        print("=" * 70)
+        print(
+            f"STAGE 3 BATCH "
+            f"{batch_start + 1:,} - "
+            f"{batch_start + len(batch):,}"
         )
+        print("=" * 70)
+        print()
 
-        for result in tqdm(
-            results,
-            total=len(remaining_candidates),
-            initial=0,
-        ):
+        with ProcessPoolExecutor(
+            max_workers=STAGE3_WORKERS
+        ) as executor:
 
-            candidate = result["candidate"]
-            analysis = result["analysis"]
-            reason = result["reason"]
+            results = executor.map(
+                analyze_stage3_worker,
+                batch
+            )
 
-            completed_count += 1
-            last_md5 = candidate["md5"]
+            for candidate, result in zip(
+                batch,
+                results
+            ):
+            
 
-            if reason is not None:
+            for result in tqdm(
+                results,
+                total=len(remaining_candidates),
+                initial=0,
+            ):
 
-                stage3_rejection_counts[
-                    reason
-                ] += 1
+                candidate = result["candidate"]
+                analysis = result["analysis"]
+                reason = result["reason"]
 
-                stage3_rejection_details.append(
-                    {
-                        "md5":
-                            candidate["md5"],
+                completed_count += 1
+                last_md5 = candidate["md5"]
 
-                        "path":
-                            candidate["path"],
-
-                        "reason":
-                            reason,
-                    }
-                )
-
-            else:
-
-                stage3_candidate = dict(
-                    candidate
-                )
-
-                stage3_candidate[
-                    "stage3"
-                ] = analysis
-
-                stage3_reports.append(
-                    stage3_candidate
-                )
-
-                if analysis[
-                    "candidate_count"
-                ] > 0:
-
-                    stage3_survivors.append(
-                        candidate["path"]
-                    )
-
-                else:
+                if reason is not None:
 
                     stage3_rejection_counts[
-                        "no_non_percussion_candidate"
+                        reason
                     ] += 1
 
                     stage3_rejection_details.append(
@@ -3764,30 +3761,71 @@ def main():
                                 candidate["path"],
 
                             "reason":
-                                "no_non_percussion_candidate",
+                                reason,
                         }
                     )
 
-            # --------------------------------------------------------------
-            # CHECKPOINT
-            # --------------------------------------------------------------
+                else:
 
-            if (
-                completed_count
-                % STAGE3_CHECKPOINT_INTERVAL
-                == 0
-            ):
+                    stage3_candidate = dict(
+                        candidate
+                    )
 
-                write_stage3_checkpoint(
-                    STAGE3_CHECKPOINT,
-                    stage3_reports,
-                    stage3_survivors,
-                    stage3_rejection_counts,
-                    stage3_rejection_details,
-                    completed_count,
-                    len(stage2_candidates),
-                    last_md5,
-                )
+                    stage3_candidate[
+                        "stage3"
+                    ] = analysis
+
+                    stage3_reports.append(
+                        stage3_candidate
+                    )
+
+                    if analysis[
+                        "candidate_count"
+                    ] > 0:
+
+                        stage3_survivors.append(
+                            candidate["path"]
+                        )
+
+                    else:
+
+                        stage3_rejection_counts[
+                            "no_non_percussion_candidate"
+                        ] += 1
+
+                        stage3_rejection_details.append(
+                            {
+                                "md5":
+                                    candidate["md5"],
+
+                                "path":
+                                    candidate["path"],
+
+                                "reason":
+                                    "no_non_percussion_candidate",
+                            }
+                        )
+
+                # --------------------------------------------------------------
+                # CHECKPOINT
+                # --------------------------------------------------------------
+
+                if (
+                    completed_count
+                    % STAGE3_CHECKPOINT_INTERVAL
+                    == 0
+                ):
+
+                    write_stage3_checkpoint(
+                        STAGE3_CHECKPOINT,
+                        stage3_reports,
+                        stage3_survivors,
+                        stage3_rejection_counts,
+                        stage3_rejection_details,
+                        completed_count,
+                        len(stage2_candidates),
+                        last_md5,
+                    )
 
 
     # =========================================================================
