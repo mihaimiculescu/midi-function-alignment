@@ -118,7 +118,7 @@ REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
 # ============================================================================
 
 STAGE3_WORKERS = 16
-STAGE3_MAX_TASKS_PER_CHILD = 250
+STAGE3_BATCH_SIZE = 2000
 
 # Save completed Stage 3 results every N files.
 STAGE3_CHECKPOINT_INTERVAL = 1000
@@ -3687,7 +3687,6 @@ def main():
 
     with ProcessPoolExecutor(
         max_workers=STAGE3_WORKERS,
-        max_tasks_per_child=250,
     ) as executor:
         
         results = executor.map(
