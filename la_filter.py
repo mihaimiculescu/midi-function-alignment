@@ -72,7 +72,11 @@ from tqdm import tqdm
 import numpy as np
 from pretty_midi_fix import UglyMIDI
 # import pretty_midi
+import MIDI
 import math
+import os
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
 
 
 # ============================================================================
@@ -109,7 +113,39 @@ SURVIVORS_TXT1B = OUTPUT_DIR1B / "candidates_track0_notes.txt"
 SUMMARY_JSON1B = OUTPUT_DIR1B / "summary.json"
 REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
 
-import MIDI
+# ============================================================================
+# STAGE 3 EXECUTION
+# ============================================================================
+
+STAGE3_WORKERS = 8
+
+# Save completed Stage 3 results every N files.
+STAGE3_CHECKPOINT_INTERVAL = 1000
+
+STAGE3_DIR = (
+    OUTPUT_DIR /
+    "stage3"
+)
+STAGE3_CANDIDATES_TXT = (
+    STAGE3_DIR /
+    "candidates.txt"
+)
+
+STAGE3_REPORTS_JSON = (
+    STAGE3_DIR /
+    "reports.json"
+)
+
+STAGE3_SUMMARY_JSON = (
+    STAGE3_DIR /
+    "summary.json"
+)
+
+STAGE3_REJECTIONS_JSON = (
+    STAGE3_DIR /
+    "rejections.json"
+)
+
 
 # ============================================================================
 # STAGE 1 FILTERS
@@ -1138,46 +1174,91 @@ def _safe_median(values):
 
 def _calculate_polyphony(notes):
     """
-    Estimate average simultaneous-note density.
+    Calculate average simultaneous-note polyphony.
 
-    We count how many notes overlap each note onset and normalize
-    around monophonic material.
+    Uses a sweep-line event algorithm rather than comparing every
+    note against every other note.
 
-    1.0 approximately means monophonic.
-    Higher values indicate increasing polyphony.
+    Returns:
+        average number of simultaneously sounding notes.
     """
 
     if not notes:
         return 0.0
 
-    starts = []
+    events = []
 
     for note in notes:
-        starts.append(
-            (
-                float(note.start),
-                float(note.end),
-            )
+
+        start = float(note.start)
+        end = float(note.end)
+
+        if end <= start:
+            continue
+
+        events.append(
+            (start, 1)
         )
 
-    overlap_sum = 0.0
+        events.append(
+            (end, -1)
+        )
 
-    for start, end in starts:
+    if not events:
+        return 0.0
 
-        overlapping = 0
+    # At identical timestamps, note-offs must occur before note-ons.
+    events.sort(
+        key=lambda event: (
+            event[0],
+            event[1]
+        )
+    )
 
-        for other_start, other_end in starts:
+    active = 0
+    previous_time = events[0][0]
 
-            if (
-                other_start < end
-                and other_end > start
-            ):
-                overlapping += 1
+    weighted_polyphony = 0.0
+    total_time = 0.0
 
-        overlap_sum += overlapping
+    i = 0
+
+    while i < len(events):
+
+        current_time = events[i][0]
+
+        if current_time > previous_time:
+
+            duration = (
+                current_time
+                - previous_time
+            )
+
+            weighted_polyphony += (
+                active
+                * duration
+            )
+
+            total_time += duration
+
+        # Apply all events at this timestamp.
+        while (
+            i < len(events)
+            and events[i][0] == current_time
+        ):
+
+            active += events[i][1]
+
+            i += 1
+
+        previous_time = current_time
+
+    if total_time <= 0:
+        return 0.0
 
     return float(
-        overlap_sum / len(notes)
+        weighted_polyphony
+        / total_time
     )
 
 
@@ -1284,42 +1365,54 @@ def _calculate_note_density(notes):
 
 
 def _calculate_monophonic_fraction(notes):
-
     """
     Fraction of note onsets which do not have another note sounding
     simultaneously.
 
-    Melody lines tend to have a relatively high value, although this
-    is deliberately only one component of the melody score.
+    Uses an interval sweep rather than O(n²) note comparisons.
     """
 
     if not notes:
         return 0.0
 
+    # Sort by start time.
+    sorted_notes = sorted(
+        notes,
+        key=lambda note: (
+            float(note.start),
+            float(note.end)
+        )
+    )
+
+    # Min-heap of active note end times.
+    import heapq
+
+    active_end_times = []
+
     isolated = 0
 
-    for note in notes:
+    for note in sorted_notes:
 
-        overlaps = False
+        start = float(note.start)
+        end = float(note.end)
 
-        for other in notes:
+        # Remove notes which have already ended.
+        while (
+            active_end_times
+            and active_end_times[0] <= start
+        ):
+            heapq.heappop(
+                active_end_times
+            )
 
-            if other is note:
-                continue
-
-            if (
-                float(other.start)
-                < float(note.end)
-                and
-                float(other.end)
-                > float(note.start)
-            ):
-
-                overlaps = True
-                break
-
-        if not overlaps:
+        # If no other note is sounding, this onset is isolated.
+        if not active_end_times:
             isolated += 1
+
+        heapq.heappush(
+            active_end_times,
+            end
+        )
 
     return float(
         isolated / len(notes)
@@ -1781,6 +1874,172 @@ def analyze_stage3_midi(
             + type(exc).__name__
         )
 
+
+def stage3_worker(candidate):
+    """
+    Worker executed in a separate process.
+
+    Returns:
+        {
+            "candidate": original Stage 2 candidate,
+            "analysis": Stage 3 analysis,
+            "reason": None
+        }
+
+    or the same structure with reason populated.
+    """
+
+    midi_path = candidate["path"]
+
+    analysis, reason = analyze_stage3_midi(
+        midi_path
+    )
+
+    return {
+        "candidate": candidate,
+        "analysis": analysis,
+        "reason": reason,
+    }
+
+
+def make_json_serializable(obj):
+    """
+    Recursively convert NumPy/scalar/container values into ordinary
+    Python objects accepted by json.dump().
+    """
+
+    if isinstance(obj, dict):
+
+        return {
+            make_json_serializable(key):
+                make_json_serializable(value)
+
+            for key, value in obj.items()
+        }
+
+    if isinstance(obj, (list, tuple)):
+
+        return [
+            make_json_serializable(value)
+            for value in obj
+        ]
+
+    if isinstance(obj, set):
+
+        return [
+            make_json_serializable(value)
+            for value in sorted(obj)
+        ]
+
+    if hasattr(obj, "item"):
+
+        try:
+            return obj.item()
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    if hasattr(obj, "tolist"):
+
+        try:
+            return obj.tolist()
+        except (
+            ValueError,
+            TypeError
+        ):
+            pass
+
+    return obj
+
+def write_stage3_checkpoint(
+    checkpoint_path,
+    reports,
+    survivors,
+    rejection_counts,
+    rejection_details,
+    completed_count,
+):
+    """
+    Atomically save Stage 3 progress.
+    """
+
+    checkpoint = {
+        "completed_count":
+            completed_count,
+
+        "reports":
+            reports,
+
+        "survivors":
+            survivors,
+
+        "rejection_counts":
+            dict(rejection_counts),
+
+        "rejection_details":
+            rejection_details,
+    }
+
+    checkpoint = make_json_serializable(
+        checkpoint
+    )
+
+    checkpoint_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # Write temporary file first.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=checkpoint_path.parent,
+        delete=False,
+        prefix=".stage3_checkpoint_",
+        suffix=".tmp",
+    ) as fh:
+
+        json.dump(
+            checkpoint,
+            fh,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+        temp_path = Path(
+            fh.name
+        )
+
+    # Atomic replacement.
+    os.replace(
+        temp_path,
+        checkpoint_path
+    )
+
+
+def load_stage3_checkpoint(
+    checkpoint_path
+):
+    """
+    Load an existing Stage 3 checkpoint.
+
+    Returns None if no checkpoint exists.
+    """
+
+    if not checkpoint_path.is_file():
+        return None
+
+    with open(
+        checkpoint_path,
+        "r",
+        encoding="utf-8",
+    ) as fh:
+
+        return json.load(fh)
+
+    
 # ============================================================================
 # BUILD MIDI INDEX
 # ============================================================================
@@ -2824,7 +3083,7 @@ def main():
         )
 
         print(
-            f"  {STAGE2_CANDIDATES_TXT}"
+            f"{STAGE2_CANDIDATES_TXT}"
         )
 
         print()
@@ -3028,25 +3287,25 @@ def main():
             exist_ok=True,
         )
 
-        STAGE2_CANDIDATES_TXT = (
-            STAGE2_DIR /
-            "candidates.txt"
-        )
+        # STAGE2_CANDIDATES_TXT = (
+        #     STAGE2_DIR /
+        #     "candidates.txt"
+        # )
 
-        STAGE2_CANDIDATES_JSON = (
-            STAGE2_DIR /
-            "candidates.json"
-        )
+        # STAGE2_CANDIDATES_JSON = (
+        #     STAGE2_DIR /
+        #     "candidates.json"
+        # )
 
-        STAGE2_SUMMARY_JSON = (
-            STAGE2_DIR /
-            "summary.json"
-        )
+        # STAGE2_SUMMARY_JSON = (
+        #     STAGE2_DIR /
+        #     "summary.json"
+        # )
 
-        STAGE2_REJECTIONS_JSON = (
-            STAGE2_DIR /
-            "rejections.json"
-        )
+        # STAGE2_REJECTIONS_JSON = (
+        #     STAGE2_DIR /
+        #     "rejections.json"
+        # )
 
         print()
         print("=" * 70)
@@ -3219,35 +3478,12 @@ def main():
     print("=" * 70)
     print()
 
-    STAGE3_DIR = (
-        OUTPUT_DIR /
-        "stage3"
-    )
 
     STAGE3_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    STAGE3_CANDIDATES_TXT = (
-        STAGE3_DIR /
-        "candidates.txt"
-    )
-
-    STAGE3_REPORTS_JSON = (
-        STAGE3_DIR /
-        "reports.json"
-    )
-
-    STAGE3_SUMMARY_JSON = (
-        STAGE3_DIR /
-        "summary.json"
-    )
-
-    STAGE3_REJECTIONS_JSON = (
-        STAGE3_DIR /
-        "rejections.json"
-    )
 
     print(
         f"Input Stage 2 candidates: "
@@ -3260,23 +3496,135 @@ def main():
     )
     print()
 
-    stage3_reports = []
-    stage3_survivors = []
-    stage3_rejection_counts = Counter()
-    stage3_rejection_details = []
+#BYE
+stage3_reports = []
+stage3_survivors = []
+stage3_rejection_counts = Counter()
+stage3_rejection_details = []
 
-    for candidate in tqdm(
-        stage2_candidates,
-        total=len(stage2_candidates),
+# =========================================================================
+# STAGE 3 CHECKPOINT
+# =========================================================================
+
+STAGE3_CHECKPOINT = (
+    STAGE3_DIR /
+    "checkpoint.json"
+)
+
+checkpoint = load_stage3_checkpoint(
+    STAGE3_CHECKPOINT
+)
+
+if checkpoint is not None:
+
+    print()
+    print("=" * 70)
+    print("STAGE 3 CHECKPOINT FOUND")
+    print("=" * 70)
+    print()
+
+    completed_count = int(
+        checkpoint.get(
+            "completed_count",
+            0
+        )
+    )
+
+    stage3_reports = (
+        checkpoint.get(
+            "reports",
+            []
+        )
+    )
+
+    stage3_survivors = (
+        checkpoint.get(
+            "survivors",
+            []
+        )
+    )
+
+    stage3_rejection_counts = Counter(
+        checkpoint.get(
+            "rejection_counts",
+            {}
+        )
+    )
+
+    stage3_rejection_details = (
+        checkpoint.get(
+            "rejection_details",
+            []
+        )
+    )
+
+    print(
+        f"Checkpoint contains: "
+        f"{completed_count:,} completed files"
+    )
+
+else:
+
+    completed_count = 0
+
+# =========================================================================
+# DETERMINE REMAINING WORK
+# =========================================================================
+
+remaining_candidates = (
+    stage2_candidates[
+        completed_count:
+    ]
+)
+
+print()
+print(
+    f"Stage 3 workers       : "
+    f"{STAGE3_WORKERS}"
+)
+
+print(
+    f"Checkpoint interval   : "
+    f"{STAGE3_CHECKPOINT_INTERVAL:,}"
+)
+
+print(
+    f"Already completed     : "
+    f"{completed_count:,}"
+)
+
+print(
+    f"Remaining files       : "
+    f"{len(remaining_candidates):,}"
+)
+
+print()
+
+# =========================================================================
+# PARALLEL STAGE 3
+# =========================================================================
+
+with ProcessPoolExecutor(
+    max_workers=STAGE3_WORKERS
+) as executor:
+
+    results = executor.map(
+        stage3_worker,
+        remaining_candidates,
+        chunksize=1,
+    )
+
+    for result in tqdm(
+        results,
+        total=len(remaining_candidates),
+        initial=0,
     ):
 
-        midi_path = candidate["path"]
+        candidate = result["candidate"]
+        analysis = result["analysis"]
+        reason = result["reason"]
 
-        analysis, reason = (
-            analyze_stage3_midi(
-                midi_path
-            )
-        )
+        completed_count += 1
 
         if reason is not None:
 
@@ -3290,64 +3638,73 @@ def main():
                         candidate["md5"],
 
                     "path":
-                        midi_path,
+                        candidate["path"],
 
                     "reason":
                         reason,
                 }
             )
 
-            continue
+        else:
 
-        # --------------------------------------------------------------
-        # Preserve all earlier information.
-        # --------------------------------------------------------------
+            stage3_candidate = dict(
+                candidate
+            )
 
-        stage3_candidate = dict(
-            candidate
-        )
+            stage3_candidate[
+                "stage3"
+            ] = analysis
 
-        stage3_candidate[
-            "stage3"
-        ] = analysis
-
-        stage3_reports.append(
-            stage3_candidate
-        )
-
-        # --------------------------------------------------------------
-        # At this stage we are NOT selecting a melody track.
-        #
-        # A file survives if it has at least one plausible
-        # non-percussion candidate.
-        # --------------------------------------------------------------
-
-        if analysis[
-            "candidate_count"
-        ] > 0:
-
-            stage3_survivors.append(
+            stage3_reports.append(
                 stage3_candidate
             )
 
-        else:
+            if analysis[
+                "candidate_count"
+            ] > 0:
 
-            stage3_rejection_counts[
-                "no_non_percussion_candidate"
-            ] += 1
+                stage3_survivors.append(
+                    stage3_candidate
+                )
 
-            stage3_rejection_details.append(
-                {
-                    "md5":
-                        candidate["md5"],
+            else:
 
-                    "path":
-                        midi_path,
+                stage3_rejection_counts[
+                    "no_non_percussion_candidate"
+                ] += 1
 
-                    "reason":
-                        "no_non_percussion_candidate",
-                }
+                stage3_rejection_details.append(
+                    {
+                        "md5":
+                            candidate["md5"],
+
+                        "path":
+                            candidate["path"],
+
+                        "reason":
+                            "no_non_percussion_candidate",
+                    }
+                )
+
+        # --------------------------------------------------------------
+        # CHECKPOINT
+        # --------------------------------------------------------------
+
+        if (
+            completed_count
+            % STAGE3_CHECKPOINT_INTERVAL
+            == 0
+        ):
+
+            write_stage3_checkpoint(
+                STAGE3_CHECKPOINT,
+                stage3_reports,
+                stage3_survivors,
+                stage3_rejection_counts,
+                stage3_rejection_details,
+                completed_count,
             )
+
 
     # =========================================================================
     # STAGE 3 REPORT
@@ -3449,35 +3806,37 @@ def main():
     ) as fh:
 
         json.dump(
-            {
-                "dataset":
-                    "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
+            make_json_serializable(
+                {
+                    "dataset":
+                        "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
 
-                "stage":
-                    "3",
+                    "stage":
+                        "3",
 
-                "description":
-                    (
-                        "MIDI structural analysis and melody "
-                        "candidate ranking. No MIDI files are "
-                        "copied, moved, or modified."
-                    ),
+                    "description":
+                        (
+                            "MIDI structural analysis and melody "
+                            "candidate ranking. No MIDI files are "
+                            "copied, moved, or modified."
+                        ),
 
-                "input_manifest":
-                    str(
-                        STAGE2_CANDIDATES_TXT
-                    ),
+                    "input_manifest":
+                        str(
+                            STAGE2_CANDIDATES_TXT
+                        ),
 
-                "excluded_channels":
-                    sorted(
-                        STAGE3_FILTERS[
-                            "excluded_channels"
-                        ]
-                    ),
+                    "excluded_channels":
+                        sorted(
+                            STAGE3_FILTERS[
+                                "excluded_channels"
+                            ]
+                        ),
 
-                "reports":
-                    stage3_reports,
-            },
+                    "reports":
+                        stage3_reports,
+                }
+            ),
             fh,
             indent=2,
             ensure_ascii=False,
@@ -3572,7 +3931,9 @@ def main():
     ) as fh:
 
         json.dump(
-            stage3_summary,
+            make_json_serializable(
+                stage3_summary
+            ),
             fh,
             indent=2,
             ensure_ascii=False,
@@ -3593,7 +3954,9 @@ def main():
     ) as fh:
 
         json.dump(
-            stage3_rejection_details,
+            make_json_serializable(
+                stage3_rejection_details
+            ),
             fh,
             indent=2,
             ensure_ascii=False,
@@ -3614,6 +3977,15 @@ def main():
     )
 
     print()
+    if STAGE3_CHECKPOINT.is_file():
+
+        STAGE3_CHECKPOINT.unlink()
+
+        print()
+        print(
+            "Stage 3 checkpoint removed after "
+            "successful completion."
+        )
 
 
 # ============================================================================
