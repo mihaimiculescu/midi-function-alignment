@@ -118,6 +118,7 @@ REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
 # ============================================================================
 
 STAGE3_WORKERS = 16
+STAGE3_MAX_TASKS_PER_CHILD = 250
 
 # Save completed Stage 3 results every N files.
 STAGE3_CHECKPOINT_INTERVAL = 1000
@@ -3685,9 +3686,10 @@ def main():
     # =========================================================================
 
     with ProcessPoolExecutor(
-        max_workers=STAGE3_WORKERS
+        max_workers=STAGE3_WORKERS,
+        max_tasks_per_child=250,
     ) as executor:
-
+        
         results = executor.map(
             stage3_worker,
             remaining_candidates,
@@ -3745,7 +3747,7 @@ def main():
                 ] > 0:
 
                     stage3_survivors.append(
-                        stage3_candidate
+                        candidate["path"]
                     )
 
                 else:
@@ -3867,12 +3869,12 @@ def main():
         encoding="utf-8",
     ) as fh:
 
-        for candidate in stage3_survivors:
 
+        for path in stage3_survivors:
             fh.write(
-                candidate["path"]
+                path
                 + "\n"
-            )
+            )            
 
     print(
         STAGE3_CANDIDATES_TXT
