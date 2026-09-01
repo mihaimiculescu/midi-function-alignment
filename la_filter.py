@@ -117,7 +117,7 @@ REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
 # STAGE 3 EXECUTION
 # ============================================================================
 
-STAGE3_WORKERS = 8
+STAGE3_WORKERS = 16
 
 # Save completed Stage 3 results every N files.
 STAGE3_CHECKPOINT_INTERVAL = 1000
