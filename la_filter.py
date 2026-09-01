@@ -117,8 +117,8 @@ REJECTIONS_JSON1B = OUTPUT_DIR1B / "rejections.json"
 # STAGE 3 EXECUTION
 # ============================================================================
 
-STAGE3_WORKERS = 16
-STAGE3_BATCH_SIZE = 2000
+STAGE3_WORKERS = 24
+STAGE3_BATCH_SIZE = 1000
 
 # Save completed Stage 3 results every N files.
 STAGE3_CHECKPOINT_INTERVAL = 1000
@@ -2256,6 +2256,26 @@ def passes_stage1(meta):
     return True, None
 
 
+def analyze_stage3_worker(candidate):
+    """
+    Worker wrapper for parallel Stage 3 analysis.
+
+    Returns the original candidate together with the Stage 3
+    analysis result and any rejection reason.
+    """
+
+    midi_path = candidate["path"]
+
+    analysis, reason = analyze_stage3_midi(
+        midi_path
+    )
+
+    return {
+        "candidate": candidate,
+        "analysis": analysis,
+        "reason": reason,
+    }
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -3614,12 +3634,27 @@ def main():
             )
         )
 
-        stage3_survivors = (
-            checkpoint.get(
-                "survivors",
-                []
-            )
-        )
+        stage3_survivors = []
+
+        for survivor in checkpoint.get(
+            "survivors",
+            []
+        ):
+
+            if isinstance(
+                survivor,
+                dict
+            ):
+
+                stage3_survivors.append(
+                    survivor["path"]
+                )
+
+            else:
+
+                stage3_survivors.append(
+                    survivor
+                )
 
         stage3_rejection_counts = Counter(
             checkpoint.get(
@@ -3651,50 +3686,7 @@ def main():
     # =========================================================================
     # DETERMINE REMAINING WORK
     # =========================================================================
-# #BYE
-#     remaining_candidates = (
-#         stage2_candidates[
-#             completed_count:
-#         ]
-#     )
 
-#     print()
-#     print(
-#         f"Stage 3 workers       : "
-#         f"{STAGE3_WORKERS}"
-#     )
-
-#     print(
-#         f"Checkpoint interval   : "
-#         f"{STAGE3_CHECKPOINT_INTERVAL:,}"
-#     )
-
-#     print(
-#         f"Already completed     : "
-#         f"{completed_count:,}"
-#     )
-
-#     print(
-#         f"Remaining files       : "
-#         f"{len(remaining_candidates):,}"
-#     )
-
-#     print()
-
-#     # =========================================================================
-#     # PARALLEL STAGE 3
-#     # =========================================================================
-
-#     with ProcessPoolExecutor(
-#         max_workers=STAGE3_WORKERS,
-#     ) as executor:
-        
-#         results = executor.map(
-#             stage3_worker,
-#             remaining_candidates,
-#             chunksize=1,
-#         )
-#NEW
     remaining_candidates = stage2_candidates[completed_count:]
 
     for batch_start in range(
@@ -3727,16 +3719,10 @@ def main():
                 batch
             )
 
-            for candidate, result in zip(
-                batch,
-                results
-            ):
-            
-
             for result in tqdm(
                 results,
-                total=len(remaining_candidates),
-                initial=0,
+                total=len(batch),
+                desc="Stage 3",
             ):
 
                 candidate = result["candidate"]
@@ -3907,11 +3893,23 @@ def main():
     ) as fh:
 
 
-        for path in stage3_survivors:
+        for survivor in stage3_survivors:
+
+            if isinstance(
+                survivor,
+                dict
+            ):
+
+                path = survivor["path"]
+
+            else:
+
+                path = survivor
+
             fh.write(
                 path
                 + "\n"
-            )            
+            )
 
     print(
         STAGE3_CANDIDATES_TXT
