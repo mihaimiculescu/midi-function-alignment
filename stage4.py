@@ -312,106 +312,67 @@ def resolve_stage3_instrument(
     winning_channels,
 ):
     """
-    Resolve the Stage 3 melody candidate to the actual raw MIDI
-    track/channel/program.
+    Resolve the Stage 3 melody candidate directly from the
+    raw MIDI program/channel information.
 
-    Stage 3 recorded:
-        - the original UglyMIDI instrument index
-        - program
-        - channels
-
-    The instrument index is only used when it is still valid.
-    Program/channel are the stable identifying information used
-    to recover the raw MIDI location.
+    The Stage 3 instrument index is retained as metadata but is
+    NOT used for resolution because the positional ordering of
+    UglyMIDI.instruments is not guaranteed to remain identical.
     """
 
-    midi = UglyMIDI(str(midi_path))
-
-    # ------------------------------------------------------------
-    # First: if the Stage 3 instrument index is still valid,
-    # use the actual UglyMIDI instrument directly.
-    # ------------------------------------------------------------
-
-    if (
-        0 <= winning_instrument_index < len(midi.instruments)
-    ):
-        instrument = midi.instruments[
-            winning_instrument_index
-        ]
-
-        if (
-            winning_program is None
-            or int(instrument.program) == int(winning_program)
-        ):
-            if (
-                not winning_channels
-                or int(instrument.channel)
-                in {
-                    int(channel)
-                    for channel in winning_channels
-                }
-            ):
-                return resolve_raw_instrument_location(
-                    midi_path,
-                    instrument.program,
-                    instrument.channel,
-                    midi,
-                )
-
-    # ------------------------------------------------------------
-    # The Stage 3 positional index no longer exists.
-    #
-    # Find the current UglyMIDI instrument using the stable
-    # program/channel information saved by Stage 3.
-    # ------------------------------------------------------------
-
-
-    matches = []
-    for instrument in midi.instruments:
-
-        if winning_program is not None:
-            if int(instrument.program) != int(winning_program):
-                continue
-
-        if winning_channels:
-            if int(instrument.channel) not in {
-                int(channel)
-                for channel in winning_channels
-            }:
-                continue
-
-        matches.append(instrument)
-
-    if len(matches) == 0:
+    if winning_program is None:
         raise ValueError(
-            "Could not resolve Stage 3 melody candidate. "
-            f"Stage 3 index={winning_instrument_index}, "
-            f"program={winning_program}, "
-            f"channels={winning_channels}. "
-            f"Current UglyMIDI instruments={len(midi.instruments)}."
+            "Stage 3 melody candidate has no program number. "
+            f"Stage 3 index={winning_instrument_index}."
         )
 
-    if len(matches) > 1:
+    if not winning_channels:
         raise ValueError(
-            "Stage 3 melody candidate is ambiguous. "
+            "Stage 3 melody candidate has no channel information. "
+            f"Stage 3 index={winning_instrument_index}, "
+            f"program={winning_program}."
+        )
+
+    matches = []
+
+    for channel in winning_channels:
+        try:
+            resolved = resolve_raw_instrument_location(
+                midi_path,
+                int(winning_program),
+                int(channel),
+            )
+        except ValueError:
+            continue
+
+        matches.append(resolved)
+
+    if not matches:
+        raise ValueError(
+            "Could not resolve Stage 3 melody candidate "
+            "in the raw MIDI. "
+            f"Stage 3 index={winning_instrument_index}, "
             f"program={winning_program}, "
             f"channels={winning_channels}."
         )
 
-    instrument = matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            "Stage 3 melody candidate resolves to multiple "
+            "raw MIDI instruments. "
+            f"Stage 3 index={winning_instrument_index}, "
+            f"program={winning_program}, "
+            f"channels={winning_channels}, "
+            f"matches={matches}."
+        )
 
-    return resolve_raw_instrument_location(
-        midi_path,
-        instrument.program,
-        instrument.channel,
-        midi,
-    )
+    return matches[0]
+
 
 def resolve_raw_instrument_location(
     midi_path,
     winning_program,
     winning_channel,
-    midi,
 ):
     """
     Locate the raw MIDI track containing the specified
