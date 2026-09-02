@@ -10,6 +10,7 @@ from pathlib import Path
 import MIDI
 import mido
 from collections import OrderedDict
+from pretty_midi_fix import UglyMIDI
 
 # ============================================================
 # CONFIGURATION
@@ -301,101 +302,125 @@ def resolve_stage3_instrument(
     winning_instrument_index,
 ):
     """
-    Reproduce UglyMIDI._load_instruments() and recover the exact
-    (program, channel, raw_track) corresponding to a Stage 3
-    instrument index.
+    Resolve the Stage 3 UglyMIDI instrument index.
 
-    Stage 3 "track" is an index into UglyMIDI.instruments.
-    It is NOT a raw MIDI track index.
+    Stage 3 stores the index of UglyMIDI.instruments[].
+    Therefore Stage 4 uses the actual UglyMIDI implementation
+    to identify the exact instrument, then maps that instrument
+    back to its raw MIDI track.
     """
 
+    # --------------------------------------------------------
+    # Let the real UglyMIDI implementation determine the
+    # instrument corresponding to the Stage 3 index.
+    # --------------------------------------------------------
+    midi = UglyMIDI(str(midi_path))
+
+    instruments = midi.instruments
+
+    if (
+        winning_instrument_index < 0
+        or winning_instrument_index >= len(instruments)
+    ):
+        raise ValueError(
+            f"Stage 3 instrument index "
+            f"{winning_instrument_index} cannot be resolved. "
+            f"UglyMIDI produced {len(instruments)} instruments."
+        )
+
+    instrument = instruments[
+        winning_instrument_index
+    ]
+
+    winning_program = instrument.program
+    winning_channel = instrument.channel
+
+    # --------------------------------------------------------
+    # Build a signature from the actual UglyMIDI instrument.
+    #
+    # UglyMIDI notes contain the exact timing in seconds that
+    # came from its private tick->time mapping.
+    #
+    # We use a multiset rather than a set because identical
+    # notes may legitimately occur more than once.
+    # --------------------------------------------------------
+    from collections import Counter
+
+    def note_signature(
+        start,
+        end,
+        pitch,
+        velocity,
+    ):
+        return (
+            round(start, 9),
+            round(end, 9),
+            int(pitch),
+            int(velocity),
+        )
+
+    winning_notes = Counter(
+        note_signature(
+            note.start,
+            note.end,
+            note.pitch,
+            note.velocity,
+        )
+        for note in instrument.notes
+    )
+
+    # --------------------------------------------------------
+    # Read the original MIDI again.
+    #
+    # We now search raw tracks for the exact program/channel
+    # note collection represented by the actual UglyMIDI
+    # instrument.
+    # --------------------------------------------------------
     midi_data = mido.MidiFile(
         filename=str(midi_path),
         clip=True,
     )
 
-    # UglyMIDI converts every track from delta time to absolute
-    # tick time before processing it.
+    # Reproduce UglyMIDI's absolute tick conversion.
     for track in midi_data.tracks:
-
         absolute_tick = 0
 
         for event in track:
+            if event.time > 0x7FFFFFFF:
+                event.time = 0
+
             absolute_tick += event.time
             event.time = absolute_tick
 
-    instrument_map = OrderedDict()
-    stragglers = {}
+    # UglyMIDI's tick-to-time mapping is authoritative.
+    tick_to_time = (
+        midi._PrettyMIDI__tick_to_time
+    )
 
-    current_instrument = [0] * 16
+    matches = []
 
-    def get_instrument(
-        program,
-        channel,
-        track_idx,
-        create_new,
-    ):
-        key = (
-            program,
-            channel,
-            track_idx,
-        )
-
-        if key in instrument_map:
-            return key
-
-        if (
-            not create_new
-            and (channel, track_idx) in stragglers
-        ):
-            return (
-                channel,
-                track_idx,
-            )
-
-        if create_new:
-
-            if (
-                channel,
-                track_idx
-            ) in stragglers:
-
-                stragglers.pop(
-                    (channel, track_idx)
-                )
-
-            instrument_map[key] = None
-
-            return key
-
-        stragglers[
-            (channel, track_idx)
-        ] = None
-
-        return (
-            channel,
-            track_idx,
-        )
-
-    for track_idx, track in enumerate(
+    for raw_track_index, track in enumerate(
         midi_data.tracks
     ):
 
+        current_program = [0] * 16
         last_note_on = {}
+
+        candidate_notes = []
 
         for event in track:
 
             if event.type == "program_change":
-
-                current_instrument[
+                current_program[
                     event.channel
                 ] = event.program
 
-            elif (
+                continue
+
+            if (
                 event.type == "note_on"
                 and event.velocity > 0
             ):
-
                 key = (
                     event.channel,
                     event.note,
@@ -403,7 +428,7 @@ def resolve_stage3_instrument(
 
                 last_note_on.setdefault(
                     key,
-                    []
+                    [],
                 ).append(
                     (
                         event.time,
@@ -411,106 +436,143 @@ def resolve_stage3_instrument(
                     )
                 )
 
-            elif (
+                continue
+
+            if not (
                 event.type == "note_off"
                 or (
                     event.type == "note_on"
                     and event.velocity == 0
                 )
             ):
+                continue
 
-                key = (
-                    event.channel,
-                    event.note,
+            key = (
+                event.channel,
+                event.note,
+            )
+
+            if key not in last_note_on:
+                continue
+
+            open_notes = last_note_on[key]
+
+            end_tick = event.time
+
+            notes_to_close = [
+                (
+                    start_tick,
+                    velocity,
                 )
+                for start_tick, velocity
+                in open_notes
+                if start_tick != end_tick
+            ]
 
-                if key not in last_note_on:
-                    continue
+            notes_to_keep = [
+                (
+                    start_tick,
+                    velocity,
+                )
+                for start_tick, velocity
+                in open_notes
+                if start_tick == end_tick
+            ]
 
-                open_notes = last_note_on[key]
+            for (
+                start_tick,
+                velocity,
+            ) in notes_to_close:
 
-                end_tick = event.time
-
-                notes_to_close = [
-                    (start_tick, velocity)
-                    for start_tick, velocity
-                    in open_notes
-                    if start_tick != end_tick
+                program = current_program[
+                    event.channel
                 ]
-
-                notes_to_keep = [
-                    (start_tick, velocity)
-                    for start_tick, velocity
-                    in open_notes
-                    if start_tick == end_tick
-                ]
-
-                if notes_to_close:
-
-                    program = current_instrument[
-                        event.channel
-                    ]
-
-                    get_instrument(
-                        program,
-                        event.channel,
-                        track_idx,
-                        True,
-                    )
 
                 if (
-                    notes_to_close
-                    and notes_to_keep
+                    event.channel
+                    != winning_channel
                 ):
-                    last_note_on[key] = notes_to_keep
-                else:
-                    del last_note_on[key]
+                    continue
 
-            elif event.type == "pitchwheel":
+                if (
+                    program
+                    != winning_program
+                ):
+                    continue
 
-                program = current_instrument[
-                    event.channel
+                start_time = tick_to_time[
+                    start_tick
                 ]
 
-                get_instrument(
-                    program,
-                    event.channel,
-                    track_idx,
-                    False,
-                )
-
-            elif event.type == "control_change":
-
-                program = current_instrument[
-                    event.channel
+                end_time = tick_to_time[
+                    end_tick
                 ]
 
-                get_instrument(
-                    program,
-                    event.channel,
-                    track_idx,
-                    False,
+                candidate_notes.append(
+                    note_signature(
+                        start_time,
+                        end_time,
+                        event.note,
+                        velocity,
+                    )
                 )
 
-    instrument_keys = list(
-        instrument_map.keys()
-    )
+            if (
+                notes_to_close
+                and notes_to_keep
+            ):
+                last_note_on[key] = (
+                    notes_to_keep
+                )
+            else:
+                del last_note_on[key]
 
-    if (
-        winning_instrument_index < 0
-        or winning_instrument_index
-        >= len(instrument_keys)
-    ):
-        raise ValueError(
-            f"Stage 3 instrument index "
-            f"{winning_instrument_index} cannot be resolved. "
-            f"UglyMIDI produced "
-            f"{len(instrument_keys)} instruments."
+        candidate_counter = Counter(
+            candidate_notes
         )
 
-    return instrument_keys[
-        winning_instrument_index
-    ]
+        if candidate_counter == winning_notes:
+            matches.append(
+                (
+                    raw_track_index,
+                    winning_channel,
+                    winning_program,
+                )
+            )
+
+    # --------------------------------------------------------
+    # We should normally get exactly one raw-track match.
+    # --------------------------------------------------------
+    if not matches:
+        raise ValueError(
+            "Could not map Stage 3 UglyMIDI instrument "
+            f"{winning_instrument_index} back to a raw MIDI "
+            "track. "
+            f"program={winning_program}, "
+            f"channel={winning_channel}, "
+            f"notes={len(instrument.notes)}."
+        )
+
+    if len(matches) > 1:
+        raise ValueError(
+            "Stage 3 UglyMIDI instrument "
+            f"{winning_instrument_index} maps to multiple "
+            "identical raw MIDI instruments: "
+            f"{matches}"
+        )
+
+    (
+        raw_track_index,
+        channel,
+        program,
+    ) = matches[0]
+
+    return (
+        program,
+        channel,
+        raw_track_index,
+    )
+
 
 def read_midi(path):
     """
