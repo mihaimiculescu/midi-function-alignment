@@ -82,23 +82,6 @@ import mido
 from tqdm import tqdm
 from dataclasses import dataclass
 
-
-@dataclass
-class NoteRecord:
-    start_tick: int
-    end_tick: int
-    pitch: int
-    velocity: int
-
-
-@dataclass
-class LogicalTrack:
-    source_track: int
-    channel: int
-    program: int
-    notes: list
-
-
 # ============================================================================
 # PATHS
 # ============================================================================
@@ -413,6 +396,26 @@ def make_output_path(
 # MIDI NOTE REPRESENTATION
 # ============================================================================
 
+class LogicalTrack:
+    __slots__ = (
+        "source_track",
+        "channel",
+        "program",
+        "notes",
+    )
+
+    def __init__(
+        self,
+        source_track,
+        channel,
+        program,
+        notes,
+    ):
+        self.source_track = int(source_track)
+        self.channel = int(channel)
+        self.program = int(program)
+        self.notes = notes
+
 class NoteRecord:
     """
     Lightweight MIDI note representation.
@@ -486,262 +489,292 @@ class NoteRecord:
 
 def parse_midi_logical_tracks(midi):
     """
-    Reconstruct the logical instruments created by UglyMIDI.
+    Reconstruct the logical instrument list produced by UglyMIDI.
 
-    Stage 3's "track" is NOT a physical MIDI track number.
-    It is the zero-based index of UglyMIDI's logical instrument list.
+    Stage 3 stores the index of UglyMIDI.instruments[] as "track".
 
-    Logical identity:
+    UglyMIDI logical identity is:
 
         (program, channel, physical_track)
 
-    Instrument creation/order follows the first NOTE-OFF that creates
-    each logical instrument, matching UglyMIDI's OrderedDict behavior.
+    Instrument insertion order is the order in which a logical
+    instrument is first created.
     """
 
     instrument_map = OrderedDict()
 
-    # UglyMIDI creates controller/pitchwheel stragglers here.
-    # They do NOT become logical instruments by themselves.
+    # Controller/pitch events occurring before an instrument has
+    # a note are stored as stragglers by UglyMIDI.
+    #
+    # They do NOT create entries in instrument_map.
     stragglers = {}
 
-    for source_track_index, track in enumerate(midi.tracks):
+    for track_idx, track in enumerate(midi.tracks):
 
-        # IMPORTANT:
-        # UglyMIDI resets program state for EACH physical track.
-        current_program = [0] * 16
+        # EXACTLY as UglyMIDI:
+        # program 0 for every channel at the start of every
+        # physical MIDI track.
+        current_instrument = [0] * 16
 
-        # Open notes are tracked independently for each physical track.
-        #
-        # key = (channel, pitch)
-        # value = [(absolute_tick, velocity), ...]
+        # EXACTLY as UglyMIDI:
+        # reset open-note state for every physical track.
         last_note_on = defaultdict(list)
 
+        # Mido gives us delta times.
+        # UglyMIDI converts them to absolute ticks before
+        # _load_instruments().
         absolute_tick = 0
 
-        for message in track:
+        for event in track:
 
-            # Mido stores delta times.
-            # UglyMIDI converts them to absolute ticks before processing.
-            absolute_tick += int(message.time)
+            absolute_tick += int(event.time)
 
-            # ----------------------------------------------------------
+            # ==========================================================
+            # TRACK NAME
+            #
+            # Doesn't affect logical identity, so nothing to store.
+            # ==========================================================
+
+            if event.type == "track_name":
+                continue
+
+            # ==========================================================
             # PROGRAM CHANGE
-            # ----------------------------------------------------------
-            if message.type == "program_change":
+            # ==========================================================
 
-                current_program[message.channel] = (
-                    message.program
+            if event.type == "program_change":
+
+                current_instrument[event.channel] = (
+                    event.program
                 )
 
                 continue
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # NOTE ON
-            # ----------------------------------------------------------
-            if (
-                message.type == "note_on"
-                and message.velocity > 0
+            # ==========================================================
+
+            elif (
+                event.type == "note_on"
+                and event.velocity > 0
             ):
 
-                key = (
-                    message.channel,
-                    message.note,
+                note_on_index = (
+                    event.channel,
+                    event.note,
                 )
 
-                last_note_on[key].append(
+                last_note_on[note_on_index].append(
                     (
                         absolute_tick,
-                        message.velocity,
+                        event.velocity,
                     )
                 )
 
-                continue
+            # ==========================================================
+            # NOTE OFF
+            #
+            # Also handles NOTE ON velocity=0.
+            # ==========================================================
 
-            # ----------------------------------------------------------
-            # NOTE OFF / NOTE ON velocity 0
-            # ----------------------------------------------------------
-            if not (
-                message.type == "note_off"
+            elif (
+                event.type == "note_off"
                 or (
-                    message.type == "note_on"
-                    and message.velocity == 0
+                    event.type == "note_on"
+                    and event.velocity == 0
                 )
             ):
-                # Controller/pitch events handled below.
-                if message.type not in (
-                    "pitchwheel",
-                    "control_change",
-                ):
-                    continue
-            else:
 
                 key = (
-                    message.channel,
-                    message.note,
+                    event.channel,
+                    event.note,
                 )
 
-                open_notes = last_note_on.get(key)
+                # UglyMIDI ignores spurious note-offs.
+                if key not in last_note_on:
+                    continue
 
-                if open_notes:
+                end_tick = absolute_tick
 
-                    notes_to_close = []
-                    notes_to_keep = []
+                open_notes = last_note_on[key]
 
-                    # Match UglyMIDI:
-                    # notes that started before this event close;
-                    # notes starting at exactly this tick remain open.
-                    for start_tick, velocity in open_notes:
+                # IMPORTANT:
+                # This is copied from UglyMIDI:
+                #
+                #     start_tick != end_tick
+                #
+                # NOT "< end_tick".
+                notes_to_close = [
+                    (start_tick, velocity)
+                    for start_tick, velocity
+                    in open_notes
+                    if start_tick != end_tick
+                ]
 
-                        if start_tick < absolute_tick:
-                            notes_to_close.append(
-                                (
-                                    start_tick,
-                                    velocity,
-                                )
-                            )
-                        else:
-                            notes_to_keep.append(
-                                (
-                                    start_tick,
-                                    velocity,
-                                )
-                            )
+                notes_to_keep = [
+                    (start_tick, velocity)
+                    for start_tick, velocity
+                    in open_notes
+                    if start_tick == end_tick
+                ]
 
-                    if notes_to_keep:
-                        last_note_on[key] = notes_to_keep
-                    else:
-                        last_note_on.pop(
-                            key,
+                for start_tick, velocity in notes_to_close:
+
+                    # UglyMIDI determines the program at NOTE OFF,
+                    # not NOTE ON.
+                    program = current_instrument[
+                        event.channel
+                    ]
+
+                    logical_key = (
+                        int(program),
+                        int(event.channel),
+                        int(track_idx),
+                    )
+
+                    # --------------------------------------------------
+                    # This corresponds directly to:
+                    #
+                    # __get_instrument(
+                    #     program,
+                    #     event.channel,
+                    #     track_idx,
+                    #     1
+                    # )
+                    # --------------------------------------------------
+
+                    if logical_key not in instrument_map:
+
+                        instrument_map[logical_key] = LogicalTrack(
+                            source_track=track_idx,
+                            channel=event.channel,
+                            program=program,
+                            notes=[],
+                        )
+
+                        # UglyMIDI transfers any straggler state
+                        # into the newly created instrument.
+                        stragglers.pop(
+                            (
+                                event.channel,
+                                track_idx,
+                            ),
                             None,
                         )
 
-                    if notes_to_close:
+                    instrument = instrument_map[
+                        logical_key
+                    ]
 
-                        channel = message.channel
-                        program = current_program[channel]
-
-                        logical_key = (
-                            program,
-                            channel,
-                            source_track_index,
+                    instrument.notes.append(
+                        NoteRecord(
+                            source_track=track_idx,
+                            channel=event.channel,
+                            program=program,
+                            pitch=event.note,
+                            velocity=velocity,
+                            start=start_tick,
+                            end=end_tick,
                         )
+                    )
 
-                        # This is the exact point at which UglyMIDI
-                        # creates/inserts a logical instrument.
-                        if logical_key not in instrument_map:
+                # ------------------------------------------------------
+                # Exactly reproduce UglyMIDI's handling of notes
+                # which started at the same tick as this note-off.
+                # ------------------------------------------------------
 
-                            instrument_map[logical_key] = LogicalTrack(
-                                source_track=source_track_index,
-                                channel=channel,
-                                program=program,
-                                notes=[],
-                            )
+                if (
+                    len(notes_to_close) > 0
+                    and len(notes_to_keep) > 0
+                ):
 
-                            # A previously created straggler is
-                            # attached to this logical instrument.
-                            stragglers.pop(
-                                (
-                                    channel,
-                                    source_track_index,
-                                ),
-                                None,
-                            )
+                    last_note_on[key] = notes_to_keep
 
-                        logical_track = instrument_map[
-                            logical_key
-                        ]
+                else:
 
-                        for (
-                            start_tick,
-                            velocity,
-                        ) in notes_to_close:
+                    del last_note_on[key]
 
-                            logical_track.notes.append(
-                                NoteRecord(
-                                    source_track=source_track_index,
-                                    channel=channel,
-                                    program=program,
-                                    pitch=message.note,
-                                    velocity=velocity,
-                                    start=start_tick,
-                                    end=absolute_tick,
-                                )
-                            )
-
-                continue
-
-            # ----------------------------------------------------------
+            # ==========================================================
             # PITCH WHEEL
             #
-            # UglyMIDI calls __get_instrument(..., create_new=0).
-            # Therefore this can create a straggler but MUST NOT insert
-            # an instrument into instrument_map.
-            # ----------------------------------------------------------
-            if message.type == "pitchwheel":
+            # create_new=0
+            #
+            # This can create a STRAGGLER but cannot create a logical
+            # instrument index.
+            # ==========================================================
 
-                channel = message.channel
-                program = current_program[channel]
+            elif event.type == "pitchwheel":
+
+                program = current_instrument[
+                    event.channel
+                ]
 
                 logical_key = (
-                    program,
-                    channel,
-                    source_track_index,
+                    int(program),
+                    int(event.channel),
+                    int(track_idx),
                 )
 
                 if logical_key not in instrument_map:
 
                     straggler_key = (
-                        channel,
-                        source_track_index,
+                        event.channel,
+                        track_idx,
                     )
 
-                    stragglers.setdefault(
-                        straggler_key,
-                        True,
-                    )
+                    if straggler_key not in stragglers:
 
-                continue
+                        stragglers[
+                            straggler_key
+                        ] = True
 
-            # ----------------------------------------------------------
+            # ==========================================================
             # CONTROL CHANGE
-            # ----------------------------------------------------------
-            if message.type == "control_change":
+            #
+            # Same semantics as pitchwheel.
+            # ==========================================================
 
-                channel = message.channel
-                program = current_program[channel]
+            elif event.type == "control_change":
+
+                program = current_instrument[
+                    event.channel
+                ]
 
                 logical_key = (
-                    program,
-                    channel,
-                    source_track_index,
+                    int(program),
+                    int(event.channel),
+                    int(track_idx),
                 )
 
                 if logical_key not in instrument_map:
 
                     straggler_key = (
-                        channel,
-                        source_track_index,
+                        event.channel,
+                        track_idx,
                     )
 
-                    stragglers.setdefault(
-                        straggler_key,
-                        True,
-                    )
+                    if straggler_key not in stragglers:
 
-                continue
+                        stragglers[
+                            straggler_key
+                        ] = True
 
-    # UglyMIDI ultimately exposes:
+    # IMPORTANT:
     #
-    #     list(instrument_map.values())
+    # UglyMIDI does:
     #
-    # so OrderedDict insertion order IS the Stage 3 track index.
+    #     self.instruments = [i for i in instrument_map.values()]
+    #
+    # Therefore OrderedDict insertion order is the Stage 3
+    # logical track index.
     return {
         "logical_tracks": list(
             instrument_map.values()
         ),
         "ticks_per_beat": midi.ticks_per_beat,
     }
+
+
 # ============================================================================
 # OUTPUT NOTE HELPERS
 # ============================================================================
