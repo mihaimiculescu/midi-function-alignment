@@ -128,6 +128,14 @@ def select_winning_candidate(report):
     qualifying = []
 
     for candidate in candidates:
+        candidate_channels = {
+            int(channel)
+            for channel in candidate.get("channels", [])
+        }
+
+        if candidate_channels & EXCLUDED_ACCOMP_CHANNELS:
+            continue
+
         try:
             pitch_mean = float(candidate["pitch_mean"])
             melody_score = float(candidate["melody_score"])
@@ -363,51 +371,38 @@ def resolve_stage3_instrument(
     }
 
     matches = []
+    for instrument in enumerate(midi.instruments):
 
-    for instrument_index, instrument in enumerate(
-        midi.instruments
-    ):
-        if (
-            winning_program is not None
-            and int(instrument.program)
-            != int(winning_program)
-        ):
-            continue
+        if winning_program is not None:
+            if int(instrument.program) != int(winning_program):
+                continue
 
-        if (
-            expected_channels
-            and int(instrument.channel)
-            not in expected_channels
-        ):
-            continue
+        if winning_channels:
+            if int(instrument.channel) not in {
+                int(channel)
+                for channel in winning_channels
+            }:
+                continue
 
-        matches.append(
-            (
-                instrument_index,
-                instrument,
-            )
-        )
+        matches.append(instrument)
 
-    if not matches:
+    if len(matches) == 0:
         raise ValueError(
             "Could not resolve Stage 3 melody candidate. "
             f"Stage 3 index={winning_instrument_index}, "
             f"program={winning_program}, "
-            f"channels={sorted(expected_channels)}. "
-            f"Current UglyMIDI instruments="
-            f"{len(midi.instruments)}."
+            f"channels={winning_channels}. "
+            f"Current UglyMIDI instruments={len(midi.instruments)}."
         )
 
     if len(matches) > 1:
         raise ValueError(
             "Stage 3 melody candidate is ambiguous. "
             f"program={winning_program}, "
-            f"channels={sorted(expected_channels)} "
-            f"matches current UglyMIDI instruments "
-            f"{[index for index, _ in matches]}."
+            f"channels={winning_channels}."
         )
 
-    instrument = matches[0][1]
+    instrument = matches[0]
 
     return resolve_raw_instrument_location(
         midi_path,
@@ -978,14 +973,6 @@ def main():
                 relative_path,
             )
         )        
-
-        work_items.append(
-            (
-                md5,
-                winning_track_index,
-                relative_path,
-            )
-        )
 
         selected_count += 1
 
