@@ -365,13 +365,9 @@ def resolve_stage3_instrument(
     # program/channel information saved by Stage 3.
     # ------------------------------------------------------------
 
-    expected_channels = {
-        int(channel)
-        for channel in winning_channels
-    }
 
     matches = []
-    for instrument in enumerate(midi.instruments):
+    for instrument in midi.instruments:
 
         if winning_program is not None:
             if int(instrument.program) != int(winning_program):
