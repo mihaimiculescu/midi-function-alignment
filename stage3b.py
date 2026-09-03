@@ -2087,7 +2087,7 @@ def process_subdirectory(subdir):
 
         actual_md5 = str(
             result[
-                "candidate"
+                "record"
             ].get(
                 "md5",
                 "",
