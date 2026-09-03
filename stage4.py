@@ -3,91 +3,153 @@
 
 """
 Los Angeles MIDI Dataset
-Stage 4 — Melody Selection and MIDI Reconstruction
+Stage 4 — Melody/Accompaniment Extraction
 
-Stage 3 has already analyzed the MIDI through UglyMIDI.
+INPUT
+-----
+Dataset/LAMDselection/selection_stage3/
+    candidates_1.json
+    candidates_2.json
+    ...
+    candidates_f.json
 
-Stage 4 therefore uses UglyMIDI.instruments[] DIRECTLY.
+The Stage 3 candidate JSON files contain the physical MIDI track numbers
+and the Stage 3 musical-analysis metrics.
 
-For every Stage 3 report:
+The ORIGINAL physical MIDI files are reopened for Stage 4 processing:
 
-    1. Find candidates satisfying:
-           pitch_mean >= 40
-           melody_score >= 0.86
-           monophonic_fraction >= 0.95
+Dataset/Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA/MIDIs/
+    1/
+    2/
+    ...
+    9/
+    a/
+    ...
+    f/
 
-    2. Select the qualifying candidate with the highest melody_score.
+NO LAMDa metadata is used.
 
-    3. Read the ORIGINAL MIDI with Mido.
+STAGE 4 QUALIFICATION
+---------------------
+A MIDI file survives iff at least one Stage 3 candidate track satisfies:
 
-    4. Read the same MIDI with UglyMIDI.
+    pitch_mean          >= 40
+    melody_score        >= 0.86
+    monophonic_fraction >= 0.95
 
-    5. Stage 3's "track" value is the zero-based index into
-       UglyMIDI.instruments[].
+Among qualifying tracks, the winner is the one with the highest
+melody_score.
 
-    6. Winner:
-           UglyMIDI instrument -> output MIDI track 0
+OUTPUT
+------
+Dataset/LAMDselection/selection_stage4/
 
-       The winner is NEVER channel-filtered.
+MIDI files:
 
-    7. All other UglyMIDI instruments:
-           - discard instruments on EXCLUDED_CHANNELS
-           - merge all remaining notes
-           - transpose notes below C2 upward by octaves
-           - remove duplicate notes
-           - optionally quantize
-           - write to output MIDI track 1
+    1/<filename>.mid
+    2/<filename>.mid
+    ...
+    f/<filename>.mid
 
-    8. Output is MIDI Type 1 with exactly two tracks.
+For each input subdirectory, one independent manifest set is produced
+directly in the Stage 4 directory:
 
-    9. Original tempo / time-signature / key-signature events are
-       preserved on output track 0.
+    candidates_1.txt
+    candidates_1.json
+    rejections_1.json
+    summary_1.json
 
-Checkpoints:
+    candidates_2.txt
+    candidates_2.json
+    rejections_2.json
+    summary_2.json
 
-    stage4/checkpoint1.json
-    stage4/checkpoint2.json
     ...
 
-Never one growing checkpoint.json.
+CHECKPOINTING
+-------------
+Checkpoints are NOT accumulated in one ever-growing file.
 
-Checkpoints are deleted only after complete successful processing.
+Instead:
+
+    checkpoint1.json
+    checkpoint2.json
+    checkpoint3.json
+    ...
+
+Each checkpoint contains only one newly completed contiguous batch.
+
+A failed/interrupted run leaves checkpoints intact.
+
+After ALL subdirectories complete successfully, ALL checkpoint*.json files
+are deleted.
+
+PROCESSING
+----------
+24 worker processes by default.
+
+Outstanding work is bounded to prevent tens of thousands of Future objects
+from accumulating in the parent process.
+
+MEMORY
+------
+Each worker handles one MIDI file at a time and releases the MidiFile
+object before returning.
+
+OUTPUT MIDI STRUCTURE
+---------------------
+Track 0:
+    - notes from the winning physical MIDI track
+    - channel 9 notes removed
+    - tempo-map messages copied from wherever they occur in the input
+    - key-signature messages copied from wherever they occur
+    - time-signature messages copied from wherever they occur
+
+Track 1:
+    - all notes from every NON-winning physical track
+    - channel 9 notes removed
+    - pitches below C2 (MIDI 36) repeatedly transposed +12 until >= C2
+    - duplicate notes removed after transposition/merging
+
+Other MIDI events such as program changes and controller events are not
+copied to Track 1 because the Stage 4 specification concerns the note
+material itself.
+
+QUANTIZATION
+------------
+quantize_output() intentionally does nothing.
+
+QUANTIZE_OUTPUT=False is provided for future development.
+
+When enabled in the future, quantization will happen AFTER duplicate
+removal and BEFORE Track 1 is written.
 """
 
+import gc
+import hashlib
 import json
-import math
 import os
-import re
 import sys
 import tempfile
 
-from concurrent.futures import ProcessPoolExecutor
-
-import mido
-from tqdm import tqdm
-
-from pretty_midi_fix import UglyMIDI
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from pathlib import Path
 
 
 # ============================================================================
 # PATHS
 # ============================================================================
 
-OUTPUT_DIR = "Dataset/LAMDselection/selection_stage1"
-
-STAGE3_DIR = os.path.join(
-    OUTPUT_DIR,
-    "stage3",
+MIDI_ROOT = Path(
+    "Dataset/Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA/MIDIs"
 )
 
-STAGE3_REPORTS_JSON = os.path.join(
-    STAGE3_DIR,
-    "reports.json",
+STAGE3_DIR = Path(
+    "Dataset/LAMDselection/selection_stage3"
 )
 
-STAGE4_DIR = os.path.join(
-    OUTPUT_DIR,
-    "stage4",
+STAGE4_DIR = Path(
+    "Dataset/LAMDselection/selection_stage4"
 )
 
 
@@ -95,78 +157,96 @@ STAGE4_DIR = os.path.join(
 # CONFIGURATION
 # ============================================================================
 
-PITCH_MEAN = 40.0
-SCORE_THRESHOLD = 0.86
-MONO_THRESHOLD = 0.95
-
 WORKERS = 24
 
-# Number of files submitted to one worker pool at a time.
-#
-# Keep this at 1 while debugging.
-# It can later be increased.
-BATCH_SIZE = 1
+# Keep the parent bounded.
+MAX_PENDING = WORKERS * 2
 
-# Write one independent checkpoint every N completed files.
+# Number of completed MIDI files represented by one checkpoint.
 CHECKPOINT_INTERVAL = 1000
 
-# MIDI channel numbers are ZERO-BASED.
-#
-# Currently:
-#     9  = human MIDI channel 10
-#     15 = human MIDI channel 16
-#
-# Keep these as parameters. We may change them later.
-EXCLUDED_CHANNELS = {
-    9,
-    15,
-}
+INPUT_SUBDIRECTORIES = tuple(
+    "123456789abcdef"
+)
 
-# MIDI C2.
+# Stage 4 thresholds.
+PITCH_MEAN = 40.0
+SCORE_THRESHOLD = 0.86
+MONO_THRESHOLD = 0.94
+
+# MIDI General MIDI percussion channel.
+GM_DRUM_CHANNEL = 9
+
+# C2.
 C2 = 36
 
-# Future hook.
+# Future quantization switch.
 QUANTIZE_OUTPUT = False
 
 
 # ============================================================================
-# QUANTIZATION PLACEHOLDER
+# JSON UTILITIES
 # ============================================================================
 
-def quantize_output(notes):
+def make_json_serializable(obj):
     """
-    Future output quantization hook.
-
-    Currently intentionally does nothing.
+    Convert NumPy/scalar/container values into JSON-safe objects.
     """
-    return notes
 
+    if isinstance(obj, dict):
+        return {make_json_serializable(key) : make_json_serializable(value) for key, value in obj.items()}
 
-# ============================================================================
-# JSON HELPERS
-# ============================================================================
+    if isinstance(obj, (list, tuple)):
+        return [
+            make_json_serializable(value)
+            for value in obj
+        ]
+
+    if isinstance(obj, set):
+        return [
+            make_json_serializable(value)
+            for value in sorted(obj)
+        ]
+
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except (ValueError, TypeError):
+            pass
+
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except (ValueError, TypeError):
+            pass
+
+    return obj
+
 
 def atomic_json_write(path, data):
     """
     Atomically write JSON.
     """
 
-    path = os.path.abspath(path)
+    path = Path(path)
 
-    parent = os.path.dirname(path)
-    os.makedirs(parent, exist_ok=True)
-
-    fd, temp_path = tempfile.mkstemp(
-        dir=parent,
-        prefix=".stage4_json_",
-        suffix=".tmp",
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
+    data = make_json_serializable(data)
+
+    temporary = None
+
     try:
-        with os.fdopen(
-            fd,
-            "w",
+        with tempfile.NamedTemporaryFile(
+            mode="w",
             encoding="utf-8",
+            dir=path.parent,
+            delete=False,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
         ) as fh:
 
             json.dump(
@@ -176,93 +256,172 @@ def atomic_json_write(path, data):
                 ensure_ascii=False,
             )
 
-            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+            temporary = Path(fh.name)
 
         os.replace(
-            temp_path,
+            temporary,
             path,
         )
 
-    except Exception:
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
+    finally:
 
-        raise
+        if (
+            temporary is not None
+            and temporary.exists()
+        ):
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 # ============================================================================
-# REPORT LOADING
+# STAGE 3 INPUT
 # ============================================================================
 
-def load_reports():
+def load_stage3_candidates(subdir):
     """
-    Load Stage 3 reports.json.
+    Load candidates_<subdir>.json from Stage 3.
     """
 
-    if not os.path.isfile(STAGE3_REPORTS_JSON):
+    path = (
+        STAGE3_DIR
+        /
+        f"candidates_{subdir}.json"
+    )
+
+    if not path.is_file():
         raise FileNotFoundError(
-            "Stage 3 reports.json not found:\n"
-            f"  {STAGE3_REPORTS_JSON}"
+            f"Stage 3 candidate file not found:\n{path}"
         )
 
     with open(
-        STAGE3_REPORTS_JSON,
+        path,
         "r",
         encoding="utf-8",
     ) as fh:
 
         data = json.load(fh)
 
-    reports = data.get("reports")
+    candidates = data.get("candidates")
 
-    if not isinstance(reports, list):
-        raise ValueError(
-            "reports.json does not contain a valid 'reports' list."
+    if not isinstance(candidates, list):
+        raise RuntimeError(
+            f"Invalid Stage 3 candidate file:\n{path}\n"
+            "Expected a top-level 'candidates' list."
         )
 
-    return reports
+    return candidates
 
 
-# ============================================================================
-# STAGE 4 QUALIFICATION
-# ============================================================================
-
-def get_qualifying_candidates(report):
+def candidate_fingerprint(candidates):
     """
-    Return all Stage 3 candidates satisfying all Stage 4 thresholds.
+    Stable fingerprint of the Stage 3 input ordering.
     """
 
-    stage3 = report.get(
-        "stage3",
-        {},
-    )
-
-    candidates = stage3.get(
-        "candidates",
-        [],
-    )
-
-    qualifying = []
+    digest = hashlib.sha256()
 
     for candidate in candidates:
 
+        md5 = str(
+            candidate.get(
+                "md5",
+                "",
+            )
+        ).lower()
+
+        path = str(
+            candidate.get(
+                "path",
+                "",
+            )
+        )
+
+        digest.update(
+            md5.encode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+        digest.update(b"\0")
+
+        digest.update(
+            path.encode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+        digest.update(b"\0")
+
+    return digest.hexdigest()
+
+
+# ============================================================================
+# QUALIFICATION
+# ============================================================================
+
+def get_stage3_analysis(candidate):
+    """
+    Return the Stage 3 candidate-track reports.
+
+    Stage 3 stores them as:
+
+        candidate["stage3"]["candidates"]
+    """
+
+    stage3 = candidate.get("stage3")
+
+    if not isinstance(stage3, dict):
+        return []
+
+    tracks = stage3.get("candidates")
+
+    if not isinstance(tracks, list):
+        return []
+
+    return tracks
+
+
+def qualifying_tracks(candidate):
+    """
+    Return all Stage 3 candidate tracks satisfying ALL Stage 4 thresholds.
+
+    The Stage 3 candidate list contains the highest-ranked tracks, so it is
+    sufficient for Stage 4 qualification.
+    """
+
+    qualifying = []
+
+    for track_report in get_stage3_analysis(candidate):
+
         try:
             pitch_mean = float(
-                candidate["pitch_mean"]
+                track_report.get(
+                    "pitch_mean",
+                    0.0,
+                )
             )
 
             melody_score = float(
-                candidate["melody_score"]
+                track_report.get(
+                    "melody_score",
+                    0.0,
+                )
             )
 
             monophonic_fraction = float(
-                candidate["monophonic_fraction"]
+                track_report.get(
+                    "monophonic_fraction",
+                    0.0,
+                )
             )
 
         except (
-            KeyError,
             TypeError,
             ValueError,
         ):
@@ -275,989 +434,2039 @@ def get_qualifying_candidates(report):
             and
             monophonic_fraction >= MONO_THRESHOLD
         ):
-            qualifying.append(candidate)
+            qualifying.append(
+                track_report
+            )
+
+    qualifying.sort(
+        key=lambda item: float(
+            item.get(
+                "melody_score",
+                0.0,
+            )
+        ),
+        reverse=True,
+    )
 
     return qualifying
 
 
-def get_winner(report):
-    """
-    Return the qualifying candidate with the highest melody_score.
-
-    Returns None if no candidate qualifies.
-    """
-
-    qualifying = get_qualifying_candidates(report)
-
-    if not qualifying:
-        return None
-
-    return max(
-        qualifying,
-        key=lambda candidate: float(
-            candidate["melody_score"]
-        ),
-    )
-
-
 # ============================================================================
-# INPUT / OUTPUT PATH
+# MIDI IMPORT
 # ============================================================================
 
-def make_output_path(input_path):
-    """
-    Preserve:
-
-        MIDIs/<hex>/<filename>.mid
-
-    as:
-
-        stage4/<hex>/<filename>.mid
-    """
-
-    absolute_input = os.path.abspath(input_path)
-
-    marker = os.sep + "MIDIs" + os.sep
-
-    position = absolute_input.find(marker)
-
-    if position < 0:
-        raise ValueError(
-            "Cannot locate '/MIDIs/' in input path:\n"
-            f"  {input_path}"
-        )
-
-    relative = absolute_input[
-        position + len(marker):
-    ]
-
-    return os.path.join(
-        os.path.abspath(STAGE4_DIR),
-        relative,
-    )
-
-
-# ============================================================================
-# NOTE HELPERS
-# ============================================================================
-
-def transpose_to_c2(pitch):
-    """
-    Raise pitch by octaves until it is >= C2 (36).
-    """
-
-    pitch = int(pitch)
-
-    if pitch >= C2:
-        return pitch
-
-    octaves = (
-        (C2 - pitch + 11)
-        // 12
-    )
-
-    return pitch + (12 * octaves)
-
-
-def remove_duplicate_notes(notes):
-    """
-    Remove duplicate notes after merging/transposition.
-
-    Identity:
-
-        start_tick
-        end_tick
-        pitch
-
-    Channel and velocity are NOT part of duplicate identity.
-    """
-
-    seen = set()
-    result = []
-
-    notes.sort(
-        key=lambda note: (
-            note["start"],
-            note["end"],
-            note["pitch"],
-        )
-    )
-
-    for note in notes:
-
-        key = (
-            int(note["start"]),
-            int(note["end"]),
-            int(note["pitch"]),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        result.append(note)
-
-    return result
-
-
-# ============================================================================
-# PRETTY MIDI TIME -> MIDI TICK
-# ============================================================================
-
-def seconds_to_tick(ugly_midi, seconds):
-    """
-    Convert an UglyMIDI/PrettyMIDI note time back to MIDI ticks.
-
-    UglyMIDI stores notes in seconds.
-    Stage 4 output is written in MIDI ticks.
-    """
-
-    return int(
-        ugly_midi.time_to_tick(
-            float(seconds)
-        )
-    )
-
-
-# ============================================================================
-# MIDI METADATA
-# ============================================================================
-
-def collect_metadata_events(original_midi):
-    """
-    Collect tempo / key / time-signature events from the original MIDI.
-
-    UglyMIDI may move these events to physical track 0, but for Stage 4
-    we simply collect them directly from the original Mido representation.
-
-    Returned events use absolute MIDI ticks.
-    """
-
-    events = []
-
-    for track_index, track in enumerate(
-        original_midi.tracks
-    ):
-
-        absolute_tick = 0
-
-        for event in track:
-
-            absolute_tick += int(
-                event.time
-            )
-
-            if event.type in {
-                "set_tempo",
-                "time_signature",
-                "key_signature",
-            }:
-
-                events.append(
-                    (
-                        absolute_tick,
-                        track_index,
-                        event.copy(time=0),
-                    )
-                )
-
-    # Stable deterministic ordering.
-    events.sort(
-        key=lambda item: (
-            item[0],
-            item[1],
-        )
-    )
-
-    return events
-
-
-def append_metadata_events(track, metadata_events):
-    """
-    Append metadata events using delta times.
-    """
-
-    previous_tick = 0
-
-    for (
-        absolute_tick,
-        _source_track,
-        event,
-    ) in metadata_events:
-
-        delta = (
-            absolute_tick
-            - previous_tick
-        )
-
-        event.time = delta
-
-        track.append(event)
-
-        previous_tick = absolute_tick
-
-
-# ============================================================================
-# NOTE EVENT WRITING
-# ============================================================================
-
-def append_note_events(
-    track,
-    notes,
-):
-    """
-    Write absolute-tick note dictionaries as delta-time Mido events.
-
-    Output notes are placed on channel 0.
-    """
-
-    events = []
-
-    for note in notes:
-
-        start = int(note["start"])
-        end = int(note["end"])
-
-        pitch = int(note["pitch"])
-        velocity = int(note["velocity"])
-
-        events.append(
-            (
-                start,
-                1,
-                mido.Message(
-                    "note_on",
-                    channel=0,
-                    note=pitch,
-                    velocity=velocity,
-                    time=0,
-                ),
-            )
-        )
-
-        events.append(
-            (
-                end,
-                0,
-                mido.Message(
-                    "note_off",
-                    channel=0,
-                    note=pitch,
-                    velocity=0,
-                    time=0,
-                ),
-            )
-        )
-
-    # Note-off before note-on at the same tick.
-    events.sort(
-        key=lambda item: (
-            item[0],
-            item[1],
-        )
-    )
-
-    previous_tick = 0
-
-    for (
-        absolute_tick,
-        _order,
-        message,
-    ) in events:
-
-        delta = (
-            absolute_tick
-            - previous_tick
-        )
-
-        message.time = delta
-
-        track.append(message)
-
-        previous_tick = absolute_tick
-
-
-# ============================================================================
-# UGLYMIDI -> STAGE 4 NOTES
-# ============================================================================
-
-def extract_instrument_notes(
-    ugly_midi,
-    instrument,
-):
-    """
-    Convert one UglyMIDI Instrument into Stage 4 tick-based notes.
-
-    IMPORTANT:
-
-    We do NOT attempt to rediscover the instrument.
-
-    UglyMIDI has already done that.
-    """
-
-    notes = []
-
-    for ugly_note in instrument.notes:
-
-        start_tick = seconds_to_tick(
-            ugly_midi,
-            ugly_note.start,
-        )
-
-        end_tick = seconds_to_tick(
-            ugly_midi,
-            ugly_note.end,
-        )
-
-        if end_tick <= start_tick:
-            continue
-
-        notes.append(
-            {
-                "start": start_tick,
-                "end": end_tick,
-                "pitch": int(
-                    ugly_note.pitch
-                ),
-                "velocity": int(
-                    ugly_note.velocity
-                ),
-            }
-        )
-
-    return notes
-
-
-# ============================================================================
-# OUTPUT MIDI
-# ============================================================================
-
-def build_output_midi(
-    original_midi,
-    ugly_midi,
-    winning_track_index,
-):
-    """
-    Build the Stage 4 Type-1 output MIDI.
-
-    Track 0 = winning UglyMIDI instrument.
-
-    Track 1 = all other UglyMIDI instruments after:
-
-        channel filtering
-        octave transposition
-        duplicate removal
-        optional quantization
-    """
-
-    instruments = ugly_midi.instruments
-
-    if (
-        winning_track_index < 0
-        or
-        winning_track_index >= len(instruments)
-    ):
-        raise IndexError(
-            "Stage 3 winning instrument index "
-            f"{winning_track_index} is outside "
-            f"UglyMIDI.instruments[] range "
-            f"0..{len(instruments) - 1}"
-        )
-
-    # ------------------------------------------------------------------
-    # Output MIDI.
-    # ------------------------------------------------------------------
-
-    output_midi = mido.MidiFile(
-        type=1,
-        ticks_per_beat=original_midi.ticks_per_beat,
-    )
-
-    melody_track = mido.MidiTrack()
-    other_track = mido.MidiTrack()
-
-    output_midi.tracks.append(
-        melody_track
-    )
-
-    output_midi.tracks.append(
-        other_track
-    )
-
-    # ------------------------------------------------------------------
-    # Original metadata goes to output track 0.
-    # ------------------------------------------------------------------
-
-    metadata_events = collect_metadata_events(
-        original_midi
-    )
-
-    append_metadata_events(
-        melody_track,
-        metadata_events,
-    )
-
-    # ------------------------------------------------------------------
-    # TRACK 0 — WINNER
-    # ------------------------------------------------------------------
-
-    winning_instrument = instruments[
-        winning_track_index
-    ]
-
-    melody_track.append(
-        mido.MetaMessage(
-            "track_name",
-            name="Stage4 Melody",
-            time=0,
-        )
-    )
-
-    # PrettyMIDI uses General MIDI program numbers 0..127.
-    winning_program = int(
-        winning_instrument.program
-    )
-
-    melody_track.append(
-        mido.Message(
-            "program_change",
-            channel=0,
-            program=winning_program,
-            time=0,
-        )
-    )
-
-    winning_notes = (
-        extract_instrument_notes(
-            ugly_midi,
-            winning_instrument,
-        )
-    )
-
-    append_note_events(
-        melody_track,
-        winning_notes,
-    )
-
-    # ------------------------------------------------------------------
-    # TRACK 1 — EVERYTHING ELSE
-    # ------------------------------------------------------------------
-
-    merged_notes = []
-
-    for instrument_index, instrument in enumerate(
-        instruments
-    ):
-
-        if instrument_index == winning_track_index:
-            continue
-
-        channel = int(
-            instrument.channel
-        )
-
-        # --------------------------------------------------------------
-        # Channel filtering.
-        #
-        # This is done at the UglyMIDI Instrument level.
-        #
-        # Every note belonging to this instrument therefore gets
-        # discarded together.
-        # --------------------------------------------------------------
-
-        if channel in EXCLUDED_CHANNELS:
-            continue
-
-        instrument_notes = (
-            extract_instrument_notes(
-                ugly_midi,
-                instrument,
-            )
-        )
-
-        for note in instrument_notes:
-
-            note["pitch"] = transpose_to_c2(
-                note["pitch"]
-            )
-
-            merged_notes.append(note)
-
-    # ------------------------------------------------------------------
-    # Duplicate removal AFTER merging/transposition.
-    # ------------------------------------------------------------------
-
-    merged_notes = remove_duplicate_notes(
-        merged_notes
-    )
-
-    # ------------------------------------------------------------------
-    # Optional quantization.
-    # ------------------------------------------------------------------
-
-    if QUANTIZE_OUTPUT:
-
-        merged_notes = quantize_output(
-            merged_notes
-        )
-
-    other_track.append(
-        mido.MetaMessage(
-            "track_name",
-            name="Stage4 Other",
-            time=0,
-        )
-    )
-
-    append_note_events(
-        other_track,
-        merged_notes,
-    )
-
-    # ------------------------------------------------------------------
-    # End markers.
-    # ------------------------------------------------------------------
-
-    melody_track.append(
-        mido.MetaMessage(
-            "end_of_track",
-            time=0,
-        )
-    )
-
-    other_track.append(
-        mido.MetaMessage(
-            "end_of_track",
-            time=0,
-        )
-    )
-
-    return output_midi
-
-
-# ============================================================================
-# ATOMIC MIDI WRITING
-# ============================================================================
-
-def write_midi_atomic(
-    midi,
-    output_path,
-):
-    """
-    Atomically write a MIDI file.
-    """
-
-    output_path = os.path.abspath(
-        output_path
-    )
-
-    parent = os.path.dirname(
-        output_path
-    )
-
-    os.makedirs(
-        parent,
-        exist_ok=True,
-    )
-
-    fd, temp_path = tempfile.mkstemp(
-        dir=parent,
-        prefix=".stage4_midi_",
-        suffix=".mid",
-    )
-
-    os.close(fd)
+def import_mido():
 
     try:
+        import mido
 
-        midi.save(
-            filename=temp_path
+        return mido
+
+    except Exception as exc:
+
+        print()
+        print("=" * 78)
+        print("ERROR: Could not import mido.")
+        print("=" * 78)
+        print()
+        print(
+            f"{type(exc).__name__}: {exc}"
         )
-
-        os.replace(
-            temp_path,
-            output_path,
-        )
-
-    except Exception:
-
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
+        print()
 
         raise
 
 
 # ============================================================================
-# ONE FILE
+# MIDI MESSAGE HELPERS
 # ============================================================================
 
-def process_one(report):
+def absolute_messages(track):
     """
-    Process one Stage 3 report.
+    Convert a MidiTrack's delta-time messages into:
+
+        (absolute_tick, message)
+
+    The original Message object is copied before returning.
     """
 
-    input_path = report.get("path")
+    result = []
 
-    if not input_path:
-        return {
-            "status": "error",
-            "reason": "missing_input_path",
-        }
+    absolute_tick = 0
 
-    winner = get_winner(report)
+    for message in track:
 
-    if winner is None:
-        return {
-            "status": "discarded",
-            "input_path": input_path,
-        }
+        absolute_tick += int(
+            message.time
+        )
 
-    winning_track_index = int(
-        winner["track"]
+        result.append(
+            (
+                absolute_tick,
+                message.copy(),
+            )
+        )
+
+    return result
+
+
+def note_message_type(message):
+    """
+    Return True for MIDI note-on and note-off messages.
+
+    A note_on with velocity 0 is also a note-off semantically, but for
+    extraction purposes we retain the original message type and pair it
+    correctly.
+    """
+
+    return (
+        not message.is_meta
+        and
+        message.type in (
+            "note_on",
+            "note_off",
+        )
     )
+
+
+def is_note_on(message):
+    return (
+        not message.is_meta
+        and
+        message.type == "note_on"
+        and
+        int(message.velocity) > 0
+    )
+
+
+def is_note_off(message):
+    if message.is_meta:
+        return False
+
+    if message.type == "note_off":
+        return True
+
+    return (
+        message.type == "note_on"
+        and
+        int(message.velocity) == 0
+    )
+
+
+# ============================================================================
+# NOTE EXTRACTION
+# ============================================================================
+
+def extract_track_notes(track):
+    """
+    Extract complete MIDI notes from one physical MIDI track.
+
+    Returns dictionaries containing:
+
+        start
+        end
+        pitch
+        velocity
+        channel
+
+    Notes are paired per MIDI channel/pitch using FIFO pairing.
+
+    This is deliberately done at the physical MIDI-message level so that
+    channel 9 can be filtered correctly.
+    """
+
+    absolute = absolute_messages(track)
+
+    active = {}
+
+    notes = []
+
+    for tick, message in absolute:
+
+        if not note_message_type(message):
+            continue
+
+        channel = int(
+            getattr(
+                message,
+                "channel",
+                0,
+            )
+        )
+
+        pitch = int(
+            message.note
+        )
+
+        key = (
+            channel,
+            pitch,
+        )
+
+        if is_note_on(message):
+
+            active.setdefault(
+                key,
+                [],
+            ).append(
+                (
+                    tick,
+                    int(message.velocity),
+                )
+            )
+
+        elif is_note_off(message):
+
+            queue = active.get(key)
+
+            if not queue:
+                continue
+
+            start_tick, velocity = queue.pop(0)
+
+            if tick < start_tick:
+                continue
+
+            notes.append(
+                {
+                    "start": int(start_tick),
+                    "end": int(tick),
+                    "pitch": pitch,
+                    "velocity": velocity,
+                    "channel": channel,
+                }
+            )
+
+    return notes
+
+
+# ============================================================================
+# NOTE TRANSFORMATION
+# ============================================================================
+
+def transpose_to_c2(pitch):
+    """
+    Repeatedly transpose a pitch upward by octaves until it is >= C2.
+    """
+
+    pitch = int(pitch)
+
+    while pitch < C2:
+        pitch += 12
+
+    return pitch
+
+
+def merge_and_transform_notes(
+    tracks,
+    winning_track_index,
+):
+    """
+    Collect all notes from every non-winning physical track.
+
+    Channel 9 notes are discarded.
+
+    Remaining notes are transposed upward until >= C2.
+
+    Duplicate notes are removed AFTER transposition.
+
+    Duplicate identity is:
+
+        (start_tick, end_tick, pitch)
+
+    Channel and velocity deliberately do not participate in duplicate
+    identity because the purpose of the operation is to collapse duplicate
+    musical notes introduced by merging.
+    """
+
+    transformed = []
+
+    for track_index, track in enumerate(tracks):
+
+        if track_index == winning_track_index:
+            continue
+
+        notes = extract_track_notes(
+            track
+        )
+
+        for note in notes:
+
+            if note["channel"] == GM_DRUM_CHANNEL:
+                continue
+
+            transformed_pitch = transpose_to_c2(
+                note["pitch"]
+            )
+
+            transformed.append(
+                {
+                    "start": int(
+                        note["start"]
+                    ),
+                    "end": int(
+                        note["end"]
+                    ),
+                    "pitch": int(
+                        transformed_pitch
+                    ),
+                    "velocity": int(
+                        note["velocity"]
+                    ),
+                    "channel": int(
+                        note["channel"]
+                    ),
+                }
+            )
+
+    # --------------------------------------------------------------
+    # Duplicate removal AFTER transposition.
+    # --------------------------------------------------------------
+
+    transformed.sort(
+        key=lambda note: (
+            note["start"],
+            note["end"],
+            note["pitch"],
+            note["channel"],
+            note["velocity"],
+        )
+    )
+
+    seen = set()
+    unique = []
+
+    for note in transformed:
+
+        identity = (
+            note["start"],
+            note["end"],
+            note["pitch"],
+        )
+
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        unique.append(note)
+
+    # Restore deterministic chronological ordering.
+    unique.sort(
+        key=lambda note: (
+            note["start"],
+            note["end"],
+            note["pitch"],
+            note["channel"],
+            note["velocity"],
+        )
+    )
+
+    return unique
+
+
+# ============================================================================
+# WINNING TRACK
+# ============================================================================
+
+def extract_winning_track_notes(
+    track,
+):
+    """
+    Extract notes from the winning physical track.
+
+    Channel 9 notes are removed.
+
+    No transposition or duplicate removal is performed on the winning
+    track.
+    """
+
+    notes = extract_track_notes(
+        track
+    )
+
+    return [
+        note
+        for note in notes
+        if note["channel"] != GM_DRUM_CHANNEL
+    ]
+
+
+# ============================================================================
+# META MAPS
+# ============================================================================
+
+MAP_MESSAGE_TYPES = frozenset(
+    {
+        "set_tempo",
+        "key_signature",
+        "time_signature",
+    }
+)
+
+
+def collect_map_messages(tracks):
+    """
+    Collect tempo/key-signature/time-signature messages from ALL physical
+    MIDI tracks.
+
+    Their original absolute tick positions are retained.
+
+    All such messages are placed into Track 0.
+    """
+
+    collected = []
+
+    for track_index, track in enumerate(tracks):
+
+        for tick, message in absolute_messages(track):
+
+            if (
+                message.is_meta
+                and
+                message.type in MAP_MESSAGE_TYPES
+            ):
+                collected.append(
+                    (
+                        int(tick),
+                        int(track_index),
+                        message.copy(),
+                    )
+                )
+
+    # Deterministic ordering.
+    collected.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+        )
+    )
+
+    return collected
+
+
+# ============================================================================
+# OUTPUT TRACK CONSTRUCTION
+# ============================================================================
+
+def append_absolute_messages(
+    output_track,
+    messages,
+):
+    """
+    Append:
+
+        (absolute_tick, Message)
+
+    to a MidiTrack using delta times.
+    """
+
+    previous_tick = 0
+
+    for absolute_tick, message in messages:
+
+        absolute_tick = int(
+            absolute_tick
+        )
+
+        delta = (
+            absolute_tick
+            -
+            previous_tick
+        )
+
+        if delta < 0:
+            raise RuntimeError(
+                "Negative MIDI delta time while constructing output."
+            )
+
+        output_track.append(
+            message.copy(
+                time=delta
+            )
+        )
+
+        previous_tick = absolute_tick
+
+
+def notes_to_messages(
+    notes,
+):
+    """
+    Convert complete note dictionaries into absolute MIDI messages.
+    """
+
+    messages = []
+
+    for note in notes:
+
+        start = int(
+            note["start"]
+        )
+
+        end = int(
+            note["end"]
+        )
+
+        if end <= start:
+            continue
+
+        pitch = int(
+            note["pitch"]
+        )
+
+        if not 0 <= pitch <= 127:
+            continue
+
+        velocity = int(
+            note["velocity"]
+        )
+
+        velocity = max(
+            0,
+            min(
+                127,
+                velocity,
+            )
+        )
+
+        channel = int(
+            note["channel"]
+        )
+
+        channel = max(
+            0,
+            min(
+                15,
+                channel,
+            )
+        )
+
+        messages.append(
+            (
+                start,
+                {
+                    "kind": "on",
+                    "pitch": pitch,
+                    "velocity": velocity,
+                    "channel": channel,
+                },
+            )
+        )
+
+        messages.append(
+            (
+                end,
+                {
+                    "kind": "off",
+                    "pitch": pitch,
+                    "velocity": 0,
+                    "channel": channel,
+                },
+            )
+        )
+
+    # At equal ticks note-offs precede note-ons.
+    messages.sort(
+        key=lambda item: (
+            item[0],
+            0 if item[1]["kind"] == "off" else 1,
+        )
+    )
+
+    return messages
+
+
+def build_note_track(
+    mido,
+    notes,
+):
+    """
+    Build a MidiTrack containing only note messages.
+    """
+
+    track = mido.MidiTrack()
+
+    absolute = notes_to_messages(
+        notes
+    )
+
+    previous_tick = 0
+
+    for tick, data in absolute:
+
+        delta = (
+            int(tick)
+            -
+            previous_tick
+        )
+
+        if delta < 0:
+            raise RuntimeError(
+                "Negative note delta time."
+            )
+
+        if data["kind"] == "on":
+
+            message = mido.Message(
+                "note_on",
+                channel=data["channel"],
+                note=data["pitch"],
+                velocity=data["velocity"],
+                time=delta,
+            )
+
+        else:
+
+            message = mido.Message(
+                "note_off",
+                channel=data["channel"],
+                note=data["pitch"],
+                velocity=0,
+                time=delta,
+            )
+
+        track.append(
+            message
+        )
+
+        previous_tick = int(tick)
+
+    return track
+
+
+def build_track_zero(
+    mido,
+    winning_notes,
+    map_messages,
+):
+    """
+    Build Track 0 from:
+
+        - tempo map
+        - key-signature map
+        - time-signature map
+        - winning-track notes
+    """
+
+    events = []
+
+    # Map messages.
+    for tick, track_index, message in map_messages:
+
+        events.append(
+            (
+                int(tick),
+                0,
+                int(track_index),
+                message.copy(),
+            )
+        )
+
+    # Winning notes.
+    for tick, data in notes_to_messages(
+        winning_notes
+    ):
+
+        if data["kind"] == "on":
+
+            message = mido.Message(
+                "note_on",
+                channel=data["channel"],
+                note=data["pitch"],
+                velocity=data["velocity"],
+                time=0,
+            )
+
+        else:
+
+            message = mido.Message(
+                "note_off",
+                channel=data["channel"],
+                note=data["pitch"],
+                velocity=0,
+                time=0,
+            )
+
+        # Note-offs before note-ons at equal ticks.
+        priority = (
+            0
+            if data["kind"] == "off"
+            else 1
+        )
+
+        events.append(
+            (
+                int(tick),
+                priority,
+                0,
+                message,
+            )
+        )
+
+    events.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            item[2],
+        )
+    )
+
+    output = mido.MidiTrack()
+
+    previous_tick = 0
+
+    for tick, _, _, message in events:
+
+        delta = (
+            int(tick)
+            -
+            previous_tick
+        )
+
+        if delta < 0:
+            raise RuntimeError(
+                "Negative Track 0 delta time."
+            )
+
+        output.append(
+            message.copy(
+                time=delta
+            )
+        )
+
+        previous_tick = int(tick)
+
+    return output
+
+
+# ============================================================================
+# QUANTIZATION
+# ============================================================================
+
+def quantize_output(notes):
+    """
+    Future quantization hook.
+
+    Currently deliberately does NOTHING.
+    """
+
+    return notes
+
+
+# ============================================================================
+# MIDI OUTPUT
+# ============================================================================
+
+def output_midi_path(
+    subdir,
+    input_path,
+):
+    """
+    Preserve the original filename and the input hexadecimal subdirectory.
+    """
+
+    output_directory = (
+        STAGE4_DIR
+        /
+        str(subdir)
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return (
+        output_directory
+        /
+        Path(input_path).name
+    )
+
+
+def atomic_midi_save(
+    midi,
+    output_path,
+):
+    """
+    Atomically save a MIDI file.
+
+    This prevents a worker interruption from leaving a partially written
+    final MIDI.
+    """
+
+    output_path = Path(
+        output_path
+    )
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary = None
 
     try:
 
-        # --------------------------------------------------------------
-        # Read original MIDI.
-        # --------------------------------------------------------------
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_path.parent,
+            delete=False,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+        ) as fh:
 
-        original_midi = mido.MidiFile(
-            filename=input_path,
-            clip=True,
-        )
-
-        # --------------------------------------------------------------
-        # Stage 4 requires Type 1 input.
-        # --------------------------------------------------------------
-
-        if original_midi.type != 1:
-            raise ValueError(
-                "Stage 4 requires MIDI Type 1 input; "
-                f"file is Type {original_midi.type}"
+            temporary = Path(
+                fh.name
             )
 
-        # --------------------------------------------------------------
-        # THIS IS THE IMPORTANT PART.
-        #
-        # UglyMIDI performs exactly the logical-instrument separation
-        # used by Stage 3.
-        # --------------------------------------------------------------
-
-        ugly_midi = UglyMIDI(
-            input_path
+        midi.save(
+            filename=str(
+                temporary
+            )
         )
 
-        # --------------------------------------------------------------
-        # Verify that Stage 3's logical index exists in the actual
-        # UglyMIDI instrument list.
-        # --------------------------------------------------------------
-
-        instrument_count = len(
-            ugly_midi.instruments
+        os.replace(
+            temporary,
+            output_path,
         )
+
+    finally:
+
+        if (
+            temporary is not None
+            and temporary.exists()
+        ):
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+# ============================================================================
+# PROCESS ONE MIDI
+# ============================================================================
+
+def process_midi(
+    candidate,
+    subdir,
+):
+    """
+    Process one Stage 3 survivor.
+
+    Returns a compact dictionary suitable for transfer to the parent.
+    """
+
+    md5 = str(
+        candidate.get(
+            "md5",
+            "",
+        )
+    ).lower()
+
+    input_path = Path(
+        str(
+            candidate.get(
+                "path",
+                "",
+            )
+        )
+    )
+
+    result_base = {
+        "md5": md5,
+        "path": str(input_path),
+    }
+
+    # --------------------------------------------------------------
+    # Stage 4 qualification.
+    # --------------------------------------------------------------
+
+    qualifying = qualifying_tracks(
+        candidate
+    )
+
+    if not qualifying:
+
+        result_base.update(
+            {
+                "kind": "rejection",
+                "reason":
+                    "no_track_satisfies_stage4_thresholds",
+            }
+        )
+
+        return result_base
+
+    winner = qualifying[0]
+
+    try:
+        winning_track_index = int(
+            winner["track"]
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+
+        result_base.update(
+            {
+                "kind": "rejection",
+                "reason":
+                    "invalid_winning_track_index",
+            }
+        )
+
+        return result_base
+
+    if not input_path.is_file():
+
+        result_base.update(
+            {
+                "kind": "rejection",
+                "reason":
+                    "midi_file_not_found",
+            }
+        )
+
+        return result_base
+
+    # --------------------------------------------------------------
+    # Read original physical MIDI.
+    # --------------------------------------------------------------
+
+    mido = import_mido()
+
+    midi = None
+
+    try:
+
+        midi = mido.MidiFile(
+            str(input_path)
+        )
+
+        tracks = midi.tracks
 
         if (
             winning_track_index < 0
             or
-            winning_track_index >= instrument_count
+            winning_track_index >= len(tracks)
         ):
-            raise IndexError(
-                "Stage 3 winning instrument index "
-                f"{winning_track_index} does not exist in "
-                f"UglyMIDI.instruments[] "
-                f"(count={instrument_count})"
+            result_base.update(
+                {
+                    "kind": "rejection",
+                    "reason":
+                        "winning_track_index_out_of_range",
+                    "winning_track":
+                        winning_track_index,
+                    "track_count":
+                        len(tracks),
+                }
             )
 
-        winning_instrument = ugly_midi.instruments[
-            winning_track_index
-        ]
+            return result_base
 
-        # --------------------------------------------------------------
-        # Build output.
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # Winning track.
+        # ----------------------------------------------------------
 
-        output_midi = build_output_midi(
-            original_midi=original_midi,
-            ugly_midi=ugly_midi,
-            winning_track_index=winning_track_index,
+        winning_notes = extract_winning_track_notes(
+            tracks[
+                winning_track_index
+            ]
         )
 
-        # --------------------------------------------------------------
-        # Output path.
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # Map messages from ALL tracks.
+        # ----------------------------------------------------------
 
-        output_path = make_output_path(
-            input_path
+        map_messages = collect_map_messages(
+            tracks
         )
 
-        # --------------------------------------------------------------
-        # Write.
-        # --------------------------------------------------------------
+        # ----------------------------------------------------------
+        # Remaining tracks.
+        # ----------------------------------------------------------
 
-        write_midi_atomic(
+        accompaniment_notes = (
+            merge_and_transform_notes(
+                tracks,
+                winning_track_index,
+            )
+        )
+
+        # ----------------------------------------------------------
+        # Future quantization hook.
+        # ----------------------------------------------------------
+
+        if QUANTIZE_OUTPUT:
+
+            accompaniment_notes = quantize_output(
+                accompaniment_notes
+            )
+
+        # ----------------------------------------------------------
+        # Build output MIDI.
+        # ----------------------------------------------------------
+
+        output_midi = mido.MidiFile(
+            type=1,
+            ticks_per_beat=midi.ticks_per_beat,
+        )
+
+        output_track_0 = build_track_zero(
+            mido,
+            winning_notes,
+            map_messages,
+        )
+
+        output_track_1 = build_note_track(
+            mido,
+            accompaniment_notes,
+        )
+
+        output_midi.tracks.append(
+            output_track_0
+        )
+
+        output_midi.tracks.append(
+            output_track_1
+        )
+
+        # ----------------------------------------------------------
+        # Save.
+        # ----------------------------------------------------------
+
+        output_path = output_midi_path(
+            subdir,
+            input_path,
+        )
+
+        atomic_midi_save(
             output_midi,
             output_path,
         )
 
-        return {
-            "status": "retained",
-            "input_path": input_path,
-            "output_path": output_path,
-            "winning_track": winning_track_index,
-            "winning_channel": int(
-                winning_instrument.channel
-            ),
-            "winning_program": int(
-                winning_instrument.program
-            ),
-            "ugly_instruments": instrument_count,
-            "melody_score": float(
-                winner["melody_score"]
-            ),
-            "pitch_mean": float(
-                winner["pitch_mean"]
-            ),
-            "monophonic_fraction": float(
-                winner["monophonic_fraction"]
-            ),
-        }
+        result_base.update(
+            {
+                "kind": "candidate",
+                "output_path":
+                    str(output_path),
+                "winning_track":
+                    winning_track_index,
+                "winning_track_melody_score":
+                    float(
+                        winner.get(
+                            "melody_score",
+                            0.0,
+                        )
+                    ),
+                "winning_track_pitch_mean":
+                    float(
+                        winner.get(
+                            "pitch_mean",
+                            0.0,
+                        )
+                    ),
+                "winning_track_monophonic_fraction":
+                    float(
+                        winner.get(
+                            "monophonic_fraction",
+                            0.0,
+                        )
+                    ),
+                "qualifying_track_count":
+                    int(
+                        len(
+                            qualifying
+                        )
+                    ),
+                "winning_notes":
+                    int(
+                        len(
+                            winning_notes
+                        )
+                    ),
+                "track1_notes":
+                    int(
+                        len(
+                            accompaniment_notes
+                        )
+                    ),
+                "input_tracks":
+                    int(
+                        len(tracks)
+                    ),
+                "output_tracks":
+                    2,
+            }
+        )
+
+        return result_base
+
+    except Exception as exc:
+
+        result_base.update(
+            {
+                "kind": "rejection",
+                "reason":
+                    "midi_processing_error:"
+                    +
+                    type(exc).__name__,
+                "error":
+                    str(exc),
+            }
+        )
+
+        return result_base
+
+    finally:
+
+        midi = None
+
+        try:
+            del midi
+        except UnboundLocalError:
+            pass
+
+        gc.collect()
+
+
+# ============================================================================
+# WORKER
+# ============================================================================
+
+def stage4_worker(
+    candidate,
+    subdir,
+):
+
+    try:
+
+        return process_midi(
+            candidate,
+            subdir,
+        )
 
     except Exception as exc:
 
         return {
-            "status": "error",
-            "input_path": input_path,
-            "reason": type(exc).__name__,
-            "message": str(exc),
+            "kind": "rejection",
+            "md5":
+                str(
+                    candidate.get(
+                        "md5",
+                        "",
+                    )
+                ).lower(),
+            "path":
+                str(
+                    candidate.get(
+                        "path",
+                        "",
+                    )
+                ),
+            "reason":
+                "worker_error:"
+                +
+                type(exc).__name__,
+            "error":
+                str(exc),
         }
 
     finally:
 
-        try:
-            del ugly_midi
-        except UnboundLocalError:
-            pass
-
-        try:
-            del original_midi
-        except UnboundLocalError:
-            pass
-
-        try:
-            del output_midi
-        except UnboundLocalError:
-            pass
+        gc.collect()
 
 
 # ============================================================================
-# CHECKPOINT MANAGEMENT
+# CHECKPOINTS
 # ============================================================================
 
-CHECKPOINT_PATTERN = re.compile(
-    r"^checkpoint([0-9]+)\.json$"
-)
+def checkpoint_paths():
 
+    paths = []
 
-def checkpoint_path(
-    checkpoint_number,
-):
-    return os.path.join(
-        STAGE4_DIR,
-        f"checkpoint{checkpoint_number}.json",
+    for path in STAGE4_DIR.glob(
+        "checkpoint*.json"
+    ):
+
+        suffix = path.stem[
+            len("checkpoint"):
+        ]
+
+        if suffix.isdigit():
+
+            paths.append(
+                path
+            )
+
+    return sorted(
+        paths,
+        key=lambda path:
+            int(
+                path.stem[
+                    len("checkpoint"):
+                ]
+            ),
     )
 
 
-def find_latest_checkpoint():
-    """
-    Return:
+def next_checkpoint_number():
 
-        (number, path)
+    paths = checkpoint_paths()
 
-    or:
+    if not paths:
+        return 1
 
-        (0, None)
-    """
-
-    if not os.path.isdir(STAGE4_DIR):
-        return 0, None
-
-    candidates = []
-
-    for filename in os.listdir(
-        STAGE4_DIR
-    ):
-
-        match = CHECKPOINT_PATTERN.match(
-            filename
+    return (
+        int(
+            paths[-1].stem[
+                len("checkpoint"):
+            ]
         )
-
-        if not match:
-            continue
-
-        number = int(
-            match.group(1)
-        )
-
-        candidates.append(
-            (
-                number,
-                os.path.join(
-                    STAGE4_DIR,
-                    filename,
-                ),
-            )
-        )
-
-    if not candidates:
-        return 0, None
-
-    return max(
-        candidates,
-        key=lambda item: item[0],
+        +
+        1
     )
 
 
 def write_checkpoint(
     checkpoint_number,
-    completed_count,
-    total_count,
-    retained_count,
-    discarded_count,
-    error_count,
-    last_path,
+    subdir,
+    input_count,
+    input_fingerprint,
+    completed_start,
+    completed_end,
+    results,
 ):
     """
-    Write one completely independent checkpoint file.
+    Write ONLY one newly completed contiguous batch.
     """
+
+    checkpoint_path = (
+        STAGE4_DIR
+        /
+        f"checkpoint{checkpoint_number}.json"
+    )
 
     checkpoint = {
         "stage": "4",
-        "checkpoint_number": checkpoint_number,
-        "completed_count": completed_count,
-        "total_count": total_count,
-        "retained_count": retained_count,
-        "discarded_count": discarded_count,
-        "error_count": error_count,
-        "last_path": last_path,
-
-        "configuration": {
-            "pitch_mean": PITCH_MEAN,
-            "score_threshold": SCORE_THRESHOLD,
-            "monophonic_threshold": MONO_THRESHOLD,
-            "workers": WORKERS,
-            "batch_size": BATCH_SIZE,
-            "checkpoint_interval": CHECKPOINT_INTERVAL,
-            "excluded_channels": sorted(
-                EXCLUDED_CHANNELS
-            ),
-            "c2": C2,
-            "quantize_output": QUANTIZE_OUTPUT,
-        },
+        "subdirectory":
+            str(subdir),
+        "input_count":
+            int(input_count),
+        "input_fingerprint":
+            str(input_fingerprint),
+        "completed_start":
+            int(completed_start),
+        "completed_end":
+            int(completed_end),
+        "result_count":
+            int(len(results)),
+        "results":
+            results,
     }
 
     atomic_json_write(
-        checkpoint_path(
-            checkpoint_number
-        ),
+        checkpoint_path,
         checkpoint,
     )
 
+    print(
+        f"  checkpoint{checkpoint_number}.json "
+        f"[{completed_start + 1:,}..{completed_end:,}]"
+    )
 
-def load_latest_checkpoint():
+
+def load_checkpoints(
+    subdir,
+    candidates,
+    input_fingerprint,
+):
     """
-    Load the newest checkpoint.
+    Reconstruct the completed prefix for one subdirectory.
 
-    Returns None if none exists.
+    Checkpoints must form a contiguous prefix.
     """
 
-    number, path = find_latest_checkpoint()
+    relevant = []
 
-    if path is None:
-        return None
+    for path in checkpoint_paths():
+
+        try:
+
+            with open(
+                path,
+                "r",
+                encoding="utf-8",
+            ) as fh:
+
+                checkpoint = json.load(
+                    fh
+                )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                f"Could not read checkpoint:\n"
+                f"{path}\n"
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if str(
+            checkpoint.get(
+                "subdirectory",
+                "",
+            )
+        ) != str(subdir):
+
+            continue
+
+        if int(
+            checkpoint.get(
+                "input_count",
+                -1,
+            )
+        ) != len(candidates):
+
+            raise RuntimeError(
+                f"Checkpoint input count mismatch:\n"
+                f"{path}"
+            )
+
+        if (
+            checkpoint.get(
+                "input_fingerprint"
+            )
+            !=
+            input_fingerprint
+        ):
+
+            raise RuntimeError(
+                f"Checkpoint input fingerprint mismatch:\n"
+                f"{path}"
+            )
+
+        relevant.append(
+            (
+                path,
+                checkpoint,
+            )
+        )
+
+    relevant.sort(
+        key=lambda item:
+            int(
+                item[1][
+                    "completed_start"
+                ]
+            )
+    )
+
+    reconstructed = []
+
+    expected_start = 0
+
+    for path, checkpoint in relevant:
+
+        start = int(
+            checkpoint[
+                "completed_start"
+            ]
+        )
+
+        end = int(
+            checkpoint[
+                "completed_end"
+            ]
+        )
+
+        results = checkpoint.get(
+            "results",
+            [],
+        )
+
+        if start != expected_start:
+
+            raise RuntimeError(
+                f"Checkpoint sequence gap/overlap "
+                f"for subdirectory {subdir}:\n"
+                f"  checkpoint: {path}\n"
+                f"  expected start: {expected_start}\n"
+                f"  actual start: {start}"
+            )
+
+        if len(results) != (
+            end - start
+        ):
+
+            raise RuntimeError(
+                f"Checkpoint result count mismatch:\n"
+                f"{path}"
+            )
+
+        reconstructed.extend(
+            results
+        )
+
+        expected_start = end
+
+    # Verify order against input.
+    for index, result in enumerate(
+        reconstructed
+    ):
+
+        expected_md5 = str(
+            candidates[index].get(
+                "md5",
+                "",
+            )
+        ).lower()
+
+        actual_md5 = str(
+            result.get(
+                "md5",
+                "",
+            )
+        ).lower()
+
+        if actual_md5 != expected_md5:
+
+            raise RuntimeError(
+                "Checkpoint ordering mismatch:\n"
+                f"  subdirectory: {subdir}\n"
+                f"  index: {index}\n"
+                f"  expected MD5: {expected_md5}\n"
+                f"  actual MD5: {actual_md5}"
+            )
+
+    return reconstructed
+
+
+# ============================================================================
+# FINAL OUTPUTS
+# ============================================================================
+
+def output_manifest_paths(subdir):
+
+    return {
+        "candidates_txt":
+            STAGE4_DIR
+            /
+            f"candidates_{subdir}.txt",
+
+        "candidates_json":
+            STAGE4_DIR
+            /
+            f"candidates_{subdir}.json",
+
+        "rejections_json":
+            STAGE4_DIR
+            /
+            f"rejections_{subdir}.json",
+
+        "summary_json":
+            STAGE4_DIR
+            /
+            f"summary_{subdir}.json",
+    }
+
+
+def write_final_outputs(
+    subdir,
+    candidates,
+    results,
+):
+    """
+    Write one independent manifest set for this input subdirectory.
+    """
+
+    survivors = []
+    rejections = []
+
+    rejection_counts = {}
+
+    for result in results:
+
+        if result.get(
+            "kind"
+        ) == "candidate":
+
+            survivors.append(
+                result
+            )
+
+        else:
+
+            rejections.append(
+                result
+            )
+
+            reason = str(
+                result.get(
+                    "reason",
+                    "unknown",
+                )
+            )
+
+            rejection_counts[
+                reason
+            ] = (
+                rejection_counts.get(
+                    reason,
+                    0,
+                )
+                +
+                1
+            )
+
+    paths = output_manifest_paths(
+        subdir
+    )
+
+    # --------------------------------------------------------------
+    # candidates_<subdir>.txt
+    # --------------------------------------------------------------
 
     with open(
-        path,
-        "r",
+        paths["candidates_txt"],
+        "w",
         encoding="utf-8",
     ) as fh:
 
-        checkpoint = json.load(fh)
+        for record in survivors:
 
-    checkpoint["_checkpoint_number"] = number
+            fh.write(
+                str(
+                    record[
+                        "output_path"
+                    ]
+                )
+                +
+                "\n"
+            )
 
-    return checkpoint
+    # --------------------------------------------------------------
+    # candidates_<subdir>.json
+    # --------------------------------------------------------------
 
+    atomic_json_write(
+        paths["candidates_json"],
+        {
+            "dataset":
+                "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
 
-def delete_all_checkpoints():
-    """
-    Delete every checkpoint<number>.json.
-    """
+            "stage":
+                "4",
 
-    if not os.path.isdir(STAGE4_DIR):
-        return
+            "input_subdirectory":
+                str(subdir),
 
-    deleted = 0
+            "input":
+                str(
+                    STAGE3_DIR
+                    /
+                    f"candidates_{subdir}.json"
+                ),
 
-    for filename in os.listdir(
-        STAGE4_DIR
-    ):
+            "midi_root":
+                str(
+                    MIDI_ROOT
+                    /
+                    str(subdir)
+                ),
 
-        if not CHECKPOINT_PATTERN.match(
-            filename
-        ):
-            continue
+            "output_root":
+                str(STAGE4_DIR),
 
-        path = os.path.join(
-            STAGE4_DIR,
-            filename,
-        )
+            "workers":
+                int(WORKERS),
 
-        try:
-            os.unlink(path)
-            deleted += 1
+            "pitch_mean_threshold":
+                float(PITCH_MEAN),
 
-        except FileNotFoundError:
-            pass
+            "melody_score_threshold":
+                float(SCORE_THRESHOLD),
 
-    print(
-        f"Deleted {deleted} checkpoint file(s)."
+            "monophonic_fraction_threshold":
+                float(MONO_THRESHOLD),
+
+            "quantize_output":
+                bool(QUANTIZE_OUTPUT),
+
+            "candidate_count":
+                int(
+                    len(survivors)
+                ),
+
+            "candidates":
+                survivors,
+        }
     )
 
+    # --------------------------------------------------------------
+    # rejections_<subdir>.json
+    # --------------------------------------------------------------
 
-# ============================================================================
-# WORK LIST
-# ============================================================================
+    atomic_json_write(
+        paths["rejections_json"],
+        {
+            "dataset":
+                "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
 
-def build_work_list(reports):
-    """
-    Determine which reports have a Stage 4 winner.
+            "stage":
+                "4",
 
-    No MIDI files are opened here.
-    """
+            "input_subdirectory":
+                str(subdir),
 
-    eligible = []
-    threshold_rejected = 0
+            "rejection_count":
+                int(
+                    len(rejections)
+                ),
 
-    for report in reports:
+            "rejection_reasons":
+                rejection_counts,
 
-        if not report.get("path"):
-            continue
+            "rejections":
+                rejections,
+        }
+    )
 
-        winner = get_winner(report)
+    # --------------------------------------------------------------
+    # summary_<subdir>.json
+    # --------------------------------------------------------------
 
-        if winner is None:
-            threshold_rejected += 1
-            continue
+    atomic_json_write(
+        paths["summary_json"],
+        {
+            "dataset":
+                "Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA",
 
-        eligible.append(report)
+            "stage":
+                "4",
+
+            "input_subdirectory":
+                str(subdir),
+
+            "input_count":
+                int(
+                    len(candidates)
+                ),
+
+            "survivor_count":
+                int(
+                    len(survivors)
+                ),
+
+            "rejected_count":
+                int(
+                    len(rejections)
+                ),
+
+            "rejection_reasons":
+                rejection_counts,
+
+            "thresholds":
+                {
+                    "pitch_mean":
+                        float(PITCH_MEAN),
+
+                    "melody_score":
+                        float(SCORE_THRESHOLD),
+
+                    "monophonic_fraction":
+                        float(MONO_THRESHOLD),
+                },
+
+            "quantize_output":
+                bool(QUANTIZE_OUTPUT),
+        }
+    )
 
     return (
-        eligible,
-        threshold_rejected,
+        len(survivors),
+        len(rejections),
     )
+
+
+# ============================================================================
+# PROCESS SUBDIRECTORY
+# ============================================================================
+
+def process_subdirectory(
+    subdir,
+):
+    candidates = load_stage3_candidates(
+        subdir
+    )
+
+    input_count = len(
+        candidates
+    )
+
+    fingerprint = candidate_fingerprint(
+        candidates
+    )
+
+    results = load_checkpoints(
+        subdir,
+        candidates,
+        fingerprint,
+    )
+
+    completed = len(
+        results
+    )
+
+    print()
+    print("=" * 78)
+    print(
+        f"STAGE 4 — SUBDIRECTORY {subdir}"
+    )
+    print("=" * 78)
+
+    print(
+        f"Stage 3 input      : {input_count:,}"
+    )
+
+    print(
+        f"Already completed  : {completed:,}"
+    )
+
+    print(
+        f"Remaining          : "
+        f"{input_count - completed:,}"
+    )
+
+    print(
+        f"Workers            : {WORKERS}"
+    )
+
+    print(
+        f"Max pending        : {MAX_PENDING}"
+    )
+
+    print(
+        f"Checkpoint interval: "
+        f"{CHECKPOINT_INTERVAL}"
+    )
+
+    print()
+
+    if completed < input_count:
+
+        pending = {}
+        ready = {}
+
+        next_submit = completed
+        next_commit = completed
+
+        checkpoint_number = (
+            next_checkpoint_number()
+        )
+
+        uncheckpointed_results = []
+
+        with ProcessPoolExecutor(
+            max_workers=WORKERS
+        ) as executor:
+
+            # ------------------------------------------------------
+            # Initial bounded submission.
+            # ------------------------------------------------------
+
+            while (
+                next_submit < input_count
+                and
+                len(pending) < MAX_PENDING
+            ):
+
+                future = executor.submit(
+                    stage4_worker,
+                    candidates[
+                        next_submit
+                    ],
+                    subdir,
+                )
+
+                pending[
+                    future
+                ] = next_submit
+
+                next_submit += 1
+
+            # ------------------------------------------------------
+            # Consume/refill.
+            # ------------------------------------------------------
+
+            while pending:
+
+                done, _ = wait(
+                    pending,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                for future in done:
+
+                    original_index = pending.pop(
+                        future
+                    )
+
+                    try:
+
+                        result = future.result()
+
+                    except Exception as exc:
+
+                        candidate = candidates[
+                            original_index
+                        ]
+
+                        result = {
+                            "kind":
+                                "rejection",
+
+                            "md5":
+                                str(
+                                    candidate.get(
+                                        "md5",
+                                        "",
+                                    )
+                                ).lower(),
+
+                            "path":
+                                str(
+                                    candidate.get(
+                                        "path",
+                                        "",
+                                    )
+                                ),
+
+                            "reason":
+                                "future_error:"
+                                +
+                                type(exc).__name__,
+
+                            "error":
+                                str(exc),
+                        }
+
+                    ready[
+                        original_index
+                    ] = result
+
+                    # --------------------------------------------------
+                    # Refill immediately.
+                    # --------------------------------------------------
+
+                    if (
+                        next_submit
+                        <
+                        input_count
+                    ):
+
+                        future2 = executor.submit(
+                            stage4_worker,
+                            candidates[
+                                next_submit
+                            ],
+                            subdir,
+                        )
+
+                        pending[
+                            future2
+                        ] = next_submit
+
+                        next_submit += 1
+
+                # --------------------------------------------------
+                # Commit only contiguous completed prefix.
+                # --------------------------------------------------
+
+                while next_commit in ready:
+
+                    result = ready.pop(
+                        next_commit
+                    )
+
+                    results.append(
+                        result
+                    )
+
+                    uncheckpointed_results.append(
+                        result
+                    )
+
+                    next_commit += 1
+
+                    if len(
+                        uncheckpointed_results
+                    ) >= CHECKPOINT_INTERVAL:
+
+                        start = (
+                            next_commit
+                            -
+                            len(
+                                uncheckpointed_results
+                            )
+                        )
+
+                        end = next_commit
+
+                        write_checkpoint(
+                            checkpoint_number,
+                            subdir,
+                            input_count,
+                            fingerprint,
+                            start,
+                            end,
+                            uncheckpointed_results,
+                        )
+
+                        checkpoint_number += 1
+
+                        uncheckpointed_results = []
+
+                        gc.collect()
+
+        # ----------------------------------------------------------
+        # Final partial checkpoint.
+        # ----------------------------------------------------------
+
+        if uncheckpointed_results:
+
+            start = (
+                next_commit
+                -
+                len(
+                    uncheckpointed_results
+                )
+            )
+
+            end = next_commit
+
+            write_checkpoint(
+                checkpoint_number,
+                subdir,
+                input_count,
+                fingerprint,
+                start,
+                end,
+                uncheckpointed_results,
+            )
+
+            uncheckpointed_results = []
+
+    # --------------------------------------------------------------
+    # Reconstruct from disk.
+    # --------------------------------------------------------------
+
+    results = load_checkpoints(
+        subdir,
+        candidates,
+        fingerprint,
+    )
+
+    # --------------------------------------------------------------
+    # Final verification.
+    # --------------------------------------------------------------
+
+    if len(results) != input_count:
+
+        raise RuntimeError(
+            f"Stage 4 result count mismatch for "
+            f"subdirectory {subdir}:\n"
+            f"  expected: {input_count:,}\n"
+            f"  actual:   {len(results):,}"
+        )
+
+    for index, result in enumerate(
+        results
+    ):
+
+        expected_md5 = str(
+            candidates[index].get(
+                "md5",
+                "",
+            )
+        ).lower()
+
+        actual_md5 = str(
+            result.get(
+                "md5",
+                "",
+            )
+        ).lower()
+
+        if actual_md5 != expected_md5:
+
+            raise RuntimeError(
+                "Final ordering verification failed:\n"
+                f"  subdirectory: {subdir}\n"
+                f"  index: {index}\n"
+                f"  expected MD5: {expected_md5}\n"
+                f"  actual MD5:   {actual_md5}"
+            )
+
+    survivor_count, rejected_count = (
+        write_final_outputs(
+            subdir,
+            candidates,
+            results,
+        )
+    )
+
+    print()
+    print(
+        f"STAGE 4 COMPLETE — {subdir}"
+    )
+
+    print(
+        f"  Input     : {input_count:,}"
+    )
+
+    print(
+        f"  Survivors : {survivor_count:,}"
+    )
+
+    print(
+        f"  Rejected  : {rejected_count:,}"
+    )
+
+    return (
+        survivor_count,
+        rejected_count,
+    )
+
+
+# ============================================================================
+# CHECKPOINT CLEANUP
+# ============================================================================
+
+def delete_all_checkpoints():
+
+    paths = checkpoint_paths()
+
+    if not paths:
+        return
+
+    print()
+    print("=" * 78)
+    print(
+        "REMOVING STAGE 4 CHECKPOINTS"
+    )
+    print("=" * 78)
+    print()
+
+    for path in paths:
+
+        path.unlink()
+
+        print(
+            f"  deleted: {path}"
+        )
 
 
 # ============================================================================
@@ -1267,380 +2476,135 @@ def build_work_list(reports):
 def main():
 
     print()
-    print("=" * 70)
-    print("Los Angeles MIDI Dataset")
-    print("STAGE 4 — MELODY SELECTION / MIDI RECONSTRUCTION")
-    print("=" * 70)
+    print("=" * 78)
+    print(
+        "Los Angeles MIDI Dataset"
+    )
+    print(
+        "STAGE 4 — MELODY / ACCOMPANIMENT EXTRACTION"
+    )
+    print("=" * 78)
     print()
 
-    os.makedirs(
-        STAGE4_DIR,
+    print(
+        "Stage 4 input = Stage 3 candidates directly."
+    )
+
+    print(
+        "LAMDa metadata = NOT USED."
+    )
+
+    print(
+        f"Pitch mean threshold = {PITCH_MEAN}"
+    )
+
+    print(
+        f"Melody score threshold = {SCORE_THRESHOLD}"
+    )
+
+    print(
+        f"Monophonic fraction threshold = "
+        f"{MONO_THRESHOLD}"
+    )
+
+    print(
+        f"Workers = {WORKERS}"
+    )
+
+    print()
+
+    if not STAGE3_DIR.is_dir():
+
+        raise RuntimeError(
+            f"Stage 3 directory does not exist:\n"
+            f"{STAGE3_DIR}"
+        )
+
+    if not MIDI_ROOT.is_dir():
+
+        raise RuntimeError(
+            f"MIDI root does not exist:\n"
+            f"{MIDI_ROOT}"
+        )
+
+    STAGE4_DIR.mkdir(
+        parents=True,
         exist_ok=True,
     )
 
-    print(
-        f"Stage 3 reports : {STAGE3_REPORTS_JSON}"
-    )
+    try:
 
-    print(
-        f"Stage 4 output  : {STAGE4_DIR}"
-    )
+        for subdir in INPUT_SUBDIRECTORIES:
 
-    print(
-        f"Workers         : {WORKERS}"
-    )
-
-    print(
-        f"Batch size      : {BATCH_SIZE}"
-    )
-
-    print(
-        f"Checkpoint every: {CHECKPOINT_INTERVAL:,} files"
-    )
-
-    print(
-        f"Excluded channels: {sorted(EXCLUDED_CHANNELS)}"
-    )
-
-    print()
-
-    # ------------------------------------------------------------------
-    # Load reports.
-    # ------------------------------------------------------------------
-
-    reports = load_reports()
-
-    print(
-        f"Reports loaded  : {len(reports):,}"
-    )
-
-    print()
-
-    # ------------------------------------------------------------------
-    # Stage 4 qualification.
-    # ------------------------------------------------------------------
-
-    eligible_reports, threshold_rejected = (
-        build_work_list(reports)
-    )
-
-    print(
-        f"Threshold survivors : {len(eligible_reports):,}"
-    )
-
-    print(
-        f"Threshold rejected  : {threshold_rejected:,}"
-    )
-
-    print()
-
-    # ------------------------------------------------------------------
-    # Resume.
-    # ------------------------------------------------------------------
-
-    checkpoint = load_latest_checkpoint()
-
-    if checkpoint is not None:
-
-        completed_count = int(
-            checkpoint["completed_count"]
-        )
-
-        retained_count = int(
-            checkpoint.get(
-                "retained_count",
-                0,
-            )
-        )
-
-        discarded_count = int(
-            checkpoint.get(
-                "discarded_count",
-                0,
-            )
-        )
-
-        error_count = int(
-            checkpoint.get(
-                "error_count",
-                0,
-            )
-        )
-
-        checkpoint_number = int(
-            checkpoint["_checkpoint_number"]
-        )
-
-        last_path = checkpoint.get(
-            "last_path"
-        )
-
-        checkpoint_total = int(
-            checkpoint["total_count"]
-        )
-
-        if checkpoint_total != len(
-            eligible_reports
-        ):
-            raise RuntimeError(
-                "Stage 4 cannot safely resume because "
-                "the number of eligible reports changed.\n\n"
-                f"Checkpoint: {checkpoint_total:,}\n"
-                f"Current   : {len(eligible_reports):,}\n\n"
-                "Do not modify reports.json while Stage 4 is running."
+            input_file = (
+                STAGE3_DIR
+                /
+                f"candidates_{subdir}.json"
             )
 
-        print("=" * 70)
-        print("RESUMING STAGE 4")
-        print("=" * 70)
+            if not input_file.is_file():
 
-        print(
-            f"Checkpoint       : "
-            f"checkpoint{checkpoint_number}.json"
-        )
-
-        print(
-            f"Already completed: {completed_count:,}"
-        )
-
-        print(
-            f"Last path        : {last_path}"
-        )
-
-        print()
-
-    else:
-
-        completed_count = 0
-        retained_count = 0
-        discarded_count = 0
-        error_count = 0
-        checkpoint_number = 0
-
-    # ------------------------------------------------------------------
-    # Check checkpoint sanity.
-    # ------------------------------------------------------------------
-
-    if (
-        completed_count < 0
-        or
-        completed_count > len(
-            eligible_reports
-        )
-    ):
-        raise RuntimeError(
-            "Invalid completed_count in checkpoint."
-        )
-
-    remaining = eligible_reports[
-        completed_count:
-    ]
-
-    # ------------------------------------------------------------------
-    # Process bounded batches.
-    # ------------------------------------------------------------------
-
-    for batch_offset in range(
-        0,
-        len(remaining),
-        BATCH_SIZE,
-    ):
-
-        batch = remaining[
-            batch_offset:
-            batch_offset + BATCH_SIZE
-        ]
-
-        absolute_start = completed_count
-
-        absolute_end = (
-            completed_count
-            + len(batch)
-        )
-
-        print("=" * 70)
-
-        print(
-            f"STAGE 4 BATCH "
-            f"{absolute_start + 1:,} - "
-            f"{absolute_end:,} "
-            f"of "
-            f"{len(eligible_reports):,}"
-        )
-
-        print("=" * 70)
-
-        # --------------------------------------------------------------
-        # Fresh process pool for each bounded batch.
-        # --------------------------------------------------------------
-
-        with ProcessPoolExecutor(
-            max_workers=WORKERS
-        ) as executor:
-
-            results = executor.map(
-                process_one,
-                batch,
-            )
-
-            for result in tqdm(
-                results,
-                total=len(batch),
-                desc="Stage 4",
-            ):
-
-                status = result.get(
-                    "status"
+                print(
+                    f"Skipping {subdir}: "
+                    f"{input_file} not found."
                 )
 
-                completed_count += 1
+                continue
 
-                if status == "retained":
+            process_subdirectory(
+                subdir
+            )
 
-                    retained_count += 1
+        # ----------------------------------------------------------
+        # ONLY successful completion reaches here.
+        # ----------------------------------------------------------
 
-                elif status == "discarded":
+        delete_all_checkpoints()
 
-                    discarded_count += 1
-
-                else:
-
-                    error_count += 1
-
-                    print()
-                    print(
-                        "ERROR processing:"
-                    )
-
-                    print(
-                        f"  {result.get('input_path')}"
-                    )
-
-                    print(
-                        f"  {result.get('reason')}: "
-                        f"{result.get('message')}"
-                    )
-
-                # ------------------------------------------------------
-                # Independent checkpoint.
-                # ------------------------------------------------------
-
-                if (
-                    completed_count
-                    % CHECKPOINT_INTERVAL
-                    == 0
-                ):
-
-                    checkpoint_number += 1
-
-                    write_checkpoint(
-                        checkpoint_number=
-                            checkpoint_number,
-
-                        completed_count=
-                            completed_count,
-
-                        total_count=
-                            len(eligible_reports),
-
-                        retained_count=
-                            retained_count,
-
-                        discarded_count=
-                            discarded_count,
-
-                        error_count=
-                            error_count,
-
-                        last_path=
-                            result.get(
-                                "input_path"
-                            ),
-                    )
-
-                    print()
-
-                    print(
-                        "Checkpoint written: "
-                        f"checkpoint{checkpoint_number}.json"
-                    )
-
-        del batch
-
-    # ------------------------------------------------------------------
-    # Completion.
-    # ------------------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print("STAGE 4 COMPLETE")
-    print("=" * 70)
-    print()
-
-    print(
-        f"Stage 4 eligible input : "
-        f"{len(eligible_reports):,}"
-    )
-
-    print(
-        f"Threshold rejected     : "
-        f"{threshold_rejected:,}"
-    )
-
-    print(
-        f"Retained / written     : "
-        f"{retained_count:,}"
-    )
-
-    print(
-        f"Discarded during work  : "
-        f"{discarded_count:,}"
-    )
-
-    print(
-        f"Processing errors      : "
-        f"{error_count:,}"
-    )
-
-    print()
-
-    if error_count > 0:
-
-        print("WARNING:")
-        print("Processing errors occurred.")
-        print("Checkpoint files have NOT been deleted.")
-        print("Fix the problem and resume Stage 4.")
+        print()
+        print("=" * 78)
+        print(
+            "STAGE 4 — ALL SUBDIRECTORIES COMPLETE"
+        )
+        print("=" * 78)
         print()
 
-        return 1
+        print(
+            "All checkpoint files were deleted."
+        )
 
-    # ------------------------------------------------------------------
-    # Only a completely successful run deletes checkpoints.
-    # ------------------------------------------------------------------
+    except KeyboardInterrupt:
 
-    delete_all_checkpoints()
+        print()
+        print("=" * 78)
+        print(
+            "STAGE 4 INTERRUPTED"
+        )
+        print("=" * 78)
+        print()
 
-    print()
-    print(
-        "Stage 4 finished successfully."
-    )
+        print(
+            "Checkpoints have been retained."
+        )
 
-    print(
-        "Output directory:"
-    )
+        raise
 
-    print(
-        f"  {STAGE4_DIR}"
-    )
+    except Exception:
 
-    print()
+        print()
+        print("=" * 78)
+        print(
+            "STAGE 4 FAILED"
+        )
+        print("=" * 78)
+        print()
 
-    return 0
+        print(
+            "Checkpoints have been retained."
+        )
 
+        raise
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
