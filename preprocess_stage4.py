@@ -631,7 +631,7 @@ def build_song_tensor(
             * FIELDS_PER_NOTE,
         ),
         PAD_VALUE,
-        dtype=torch.uint8,
+        dtype=torch.long,
     )
 
     # --------------------------------------------------------------
@@ -1180,6 +1180,11 @@ def main():
                 f"({result['reason']})"
             )
 
+            if result.get("error"):
+                print(
+                    f"    ERROR: {result['error']}"
+                )
+
             continue
 
         tensor = result["tensor"]
@@ -1326,7 +1331,7 @@ def main():
     # Final consistency checks.
     # --------------------------------------------------------------
 
-    if data.dtype != torch.uint8:
+    if data.dtype != torch.long:
 
         raise RuntimeError(
             f"Unexpected tensor dtype: "
