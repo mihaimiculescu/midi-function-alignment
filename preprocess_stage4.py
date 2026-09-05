@@ -3,189 +3,101 @@
 
 """
 Stage 4 -> CP16 preprocessing
-PARALLEL VERSION
+PARALLEL / MEMORY-SAFE VERSION
 
-Converts the clean MIDI corpus produced by stage4.py into the CP tensor
-representation expected by the existing CP transformer / Yinyang training
-code.
+Converts the clean MIDI corpus produced by stage4.py into the exact
+CP tensor representation expected by the existing CP Transformer /
+Yinyang training pipeline.
 
-This version is specifically designed for a large Stage 4 corpus.
+IMPORTANT:
+    This script does NOT use UglyMIDI.
+    This script does NOT use pretty_midi.
+    This script does NOT use the old LA quantization filter.
 
-IMPORTANT
----------
-This script intentionally does NOT use:
+Stage 4 MIDI files are authoritative.
 
-    UglyMIDI
-    pretty_midi
-    the old preprocess_midi()
-    the old quantization filter
-
-Stage 4 MIDI semantics are authoritative.
-
-PARALLELISM
------------
-Default:
-
-    24 worker processes
-
-Each worker:
-
-    1. reads one MIDI
-    2. extracts its notes
-    3. converts it to CP16
-    4. writes that song tensor to a temporary staging file
-    5. returns only lightweight metadata to the parent
-
-Large tensors are therefore NOT sent through multiprocessing pipes.
-
-This is important for RAM usage.
-
-The parent subsequently assembles the final contiguous tensor in deterministic
-input order.
-
-PYTORCH THREADING
------------------
-Each worker is restricted to one PyTorch CPU thread.
-
-Otherwise:
-
-    24 processes × N PyTorch threads
-
-could easily overwhelm the machine.
-
-MEMORY MANAGEMENT
------------------
-Only one song tensor exists in each worker at a time.
-
-Workers use:
-
-    maxtasksperchild
-
-so worker processes are periodically replaced, preventing long-running
-Python/native allocations from accumulating indefinitely.
-
-The parent does not retain individual song tensors while preprocessing.
-
-INPUT
------
-Dataset/LAMDselection/selection_stage4/
-
-    1/*.mid
-    2/*.mid
-    ...
-    f/*.mid
-
-Each Stage 4 MIDI contains exactly two musical tracks:
-
-    Track 0 = melody
-    Track 1 = accompaniment
-
-OUTPUT
-------
-data/<dataset_name>.pt
-data/<dataset_name>.length.pt
-data/<dataset_name>.pitch_shift_range.pt
-data/<dataset_name>.txt
-data/<dataset_name>.json
-
-The .pt tensor has shape:
-
-    [total_CP_timesteps, 64]
-
-because:
+CP representation:
 
     2 tracks
     x 8 notes
     x 4 fields
-    = 64 values per timestep
 
-Each CP note contains:
+    = 64 values per CP timestep
 
-    [program, pitch, duration, velocity]
+Each note:
 
-Padding:
+    [program, pitch, duration_index, velocity]
 
-    255
+IMPORTANT DURATION REPRESENTATION
+---------------------------------
 
-EOS:
+The CP Transformer does NOT store the actual duration template value.
 
-    program = 254
-
-CP16
-----
-beat_div = 4
+It stores the INDEX into DURATION_TEMPLATES.
 
 Therefore:
 
-    1 quarter-note beat = 4 CP positions
-    1 CP position       = 1/16 note
+    template value       stored index
 
-Duration vocabulary:
+        1                    0
+        2                    1
+        3                    2
+        4                    3
+        6                    4
+        ...
+        256                 15
+        384                 16
+        512                 17
+        ...
+        4096                23
 
-    1, 2, 3, 4, 6, 8, 12, ... 4096
+This is required by cp_transformer.py, whose tokenizer has exactly
+24 duration categories.
 
-The tensor MUST use torch.long because duration values above 255 are valid.
+The tensor is torch.long because the representation also uses values
+such as 255 padding and 254 EOS, and because keeping the representation
+in int64 avoids the uint8 overflow that occurs with actual duration
+values above 255.
 
-PROGRAMS
---------
-Stage 4 contains semantic tracks rather than original instrument identity.
+The ACTUAL quantized duration in CP steps is used only to determine
+the song's temporal extent. The duration FIELD stored in the tensor
+is the duration-template INDEX.
 
-Therefore:
+Input:
 
-    Track 0 melody         -> program 64
-    Track 1 accompaniment  -> program 0
+    Dataset/LAMDselection/selection_stage4/
+        1/*.mid
+        2/*.mid
+        ...
+        f/*.mid
 
-PITCH SHIFT
------------
-For every song:
+Each Stage 4 MIDI must contain exactly two tracks:
 
-    minimum shift = -minimum_pitch
-    maximum shift = 127 - maximum_pitch
+    Track 0 = melody
+    Track 1 = accompaniment
 
-The existing OverlapFramedDataset subsequently clamps these to:
+Output:
 
-    [-5, +6]
+    data/<dataset_name>.pt
+    data/<dataset_name>.length.pt
+    data/<dataset_name>.pitch_shift_range.pt
+    data/<dataset_name>.txt
+    data/<dataset_name>.json
 
-SONG BOUNDARIES
----------------
-No song is split here.
+Default dataset name:
 
-Each song remains a complete CP tensor in the staging area.
-
-The final .length.pt contains one length per surviving song.
-
-OverlapFramedDataset uses these lengths to guarantee that its
-384-step / 192-step windows never cross song boundaries.
-
-USAGE
------
-Default:
-
-    python preprocess_stage4.py
+    lamd_stage4_cp8_v1
 
 Default workers:
 
-    24
+    16
 
-Explicit:
+Usage:
 
-    python preprocess_stage4.py --workers 24
+    python preprocess_stage4.py --workers 16
 
-For example:
-
-    python preprocess_stage4.py \
-        --workers 24 \
-        --dataset-name lamd_stage4_cp8_v1
-
-Other options:
-
-    --input
-    --output
-    --dataset-name
-    --workers
-    --maxtasksperchild
-    --staging-dir
-
+A previous staging directory is deliberately NOT reused. Delete it
+before restarting an interrupted run.
 """
 
 import argparse
@@ -196,7 +108,6 @@ import multiprocessing as mp
 import os
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -217,13 +128,9 @@ DEFAULT_DATASET_NAME = (
     "lamd_stage4_cp8_v1"
 )
 
-DEFAULT_WORKERS = 24
+# 16 is intentionally chosen as the practical default.
+DEFAULT_WORKERS = 16
 
-# Replace workers periodically.
-#
-# This is not needed because a song is retained in memory after completion;
-# it is protection against gradual allocator/native-library growth in a
-# long-running worker process.
 DEFAULT_MAX_TASKS_PER_CHILD = 100
 
 BEAT_DIV = 4
@@ -244,12 +151,15 @@ MELODY_PROGRAM = 64
 
 ACCOMPANIMENT_PROGRAM = 0
 
+GM_DRUM_CHANNEL = 9
+
 MIN_PITCH = 0
 
 MAX_PITCH = 127
 
-GM_DRUM_CHANNEL = 9
 
+# These are the exact CP duration templates used by the original
+# preprocess_large_midi_dataset.py.
 DURATION_TEMPLATES = (
     1,
     2,
@@ -277,9 +187,82 @@ DURATION_TEMPLATES = (
     4096,
 )
 
+# CP representation values.
 PAD_VALUE = 255
-
 EOS_VALUE = 254
+
+
+# ============================================================================
+# DURATION BOUNDARIES
+# ============================================================================
+
+# The original code computes:
+#
+#   duration_boundaries =
+#       (DURATION_TEMPLATES[1:] + DURATION_TEMPLATES[:-1]) / 2
+#
+# and then:
+#
+#   np.searchsorted(duration_boundaries, duration)
+#
+# which returns the TEMPLATE INDEX.
+#
+# We calculate the same result without numpy.
+
+DURATION_BOUNDARIES = tuple(
+    (
+        DURATION_TEMPLATES[i]
+        + DURATION_TEMPLATES[i + 1]
+    )
+    / 2.0
+    for i in range(
+        len(DURATION_TEMPLATES) - 1
+    )
+)
+
+
+def duration_to_template_index(duration):
+    """
+    Convert an actual CP duration into the exact duration-template
+    INDEX expected by the CP Transformer.
+
+    Returns:
+
+        0 .. 23
+
+    This deliberately does NOT return the duration value.
+    """
+
+    duration = int(duration)
+
+    if duration <= 0:
+        duration = 1
+
+    for index, boundary in enumerate(
+        DURATION_BOUNDARIES
+    ):
+        if duration < boundary:
+            return index
+
+    return len(DURATION_TEMPLATES) - 1
+
+
+def duration_template_value(index):
+    """
+    Return the actual CP duration represented by a duration-template
+    index.
+    """
+
+    index = int(index)
+
+    if not (
+        0 <= index < len(DURATION_TEMPLATES)
+    ):
+        raise ValueError(
+            f"Invalid duration template index: {index}"
+        )
+
+    return DURATION_TEMPLATES[index]
 
 
 # ============================================================================
@@ -288,32 +271,9 @@ EOS_VALUE = 254
 
 def worker_init():
     """
-    Initialize one multiprocessing worker.
-
-    Critical:
-    prevent each worker from starting its own large pool of PyTorch
-    CPU threads.
-
-    24 workers × many BLAS/PyTorch threads would be counterproductive.
+    Prevent multiprocessing workers from multiplying CPU thread pools.
     """
 
-    try:
-        import torch
-
-        torch.set_num_threads(1)
-
-        try:
-            torch.set_num_interop_threads(1)
-        except RuntimeError:
-            # Can occur if another torch operation initialized the
-            # inter-op pool before this call. Not fatal.
-            pass
-
-    except Exception:
-        pass
-
-    # Avoid OpenMP / MKL thread multiplication where these libraries
-    # are present.
     os.environ.setdefault(
         "OMP_NUM_THREADS",
         "1",
@@ -329,9 +289,22 @@ def worker_init():
         "1",
     )
 
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+
+    except Exception:
+        pass
+
 
 # ============================================================================
-# IMPORT MIDO
+# MIDO
 # ============================================================================
 
 def import_mido():
@@ -370,13 +343,11 @@ def is_note_off(message):
 
 def extract_notes(track):
     """
-    Convert delta-time MIDI events into complete notes.
+    Convert delta-time MIDI messages into complete notes.
 
-    Notes are paired by:
+    Notes are paired FIFO by:
 
         channel + pitch
-
-    using FIFO pairing.
     """
 
     active = {}
@@ -476,11 +447,12 @@ def ticks_to_cp_position(
     """
     Convert MIDI ticks to CP16 positions.
 
-        beat_div = 4
+    beat_div = 4
 
-    means:
+    Therefore:
 
-        4 CP positions per quarter-note beat.
+        1 quarter-note beat = 4 CP positions
+        1 CP position       = 1/16 note
     """
 
     if ticks_per_beat <= 0:
@@ -506,46 +478,6 @@ def ticks_to_cp_position(
 
 
 # ============================================================================
-# DURATION -> CP TEMPLATE
-# ============================================================================
-
-def duration_to_template(
-    duration,
-):
-    """
-    Match the duration quantization of the original CP preprocessing.
-
-    This is equivalent to selecting the nearest duration template using
-    midpoint boundaries.
-    """
-
-    if duration <= 0:
-        duration = 1
-
-    templates = DURATION_TEMPLATES
-
-    for index in range(
-        len(templates) - 1
-    ):
-
-        left = templates[index]
-
-        right = templates[
-            index + 1
-        ]
-
-        boundary = (
-            float(left + right)
-            / 2.0
-        )
-
-        if duration < boundary:
-            return left
-
-    return templates[-1]
-
-
-# ============================================================================
 # NOTE -> CP
 # ============================================================================
 
@@ -554,6 +486,19 @@ def convert_notes_to_cp(
     ticks_per_beat,
     program,
 ):
+    """
+    Convert MIDI notes to CP notes.
+
+    Each returned note contains:
+
+        start
+        pitch
+        duration_index
+        duration_steps
+        velocity
+        program
+    """
+
     converted = []
 
     for note in notes:
@@ -588,13 +533,13 @@ def convert_notes_to_cp(
         if end <= start:
             end = start + 1
 
-        duration = (
+        duration_steps = (
             end - start
         )
 
-        duration = (
-            duration_to_template(
-                duration
+        duration_index = (
+            duration_to_template_index(
+                duration_steps
             )
         )
 
@@ -616,12 +561,24 @@ def convert_notes_to_cp(
                 "pitch": int(
                     pitch
                 ),
-                "duration": int(
-                    duration
+
+                # IMPORTANT:
+                # Store the TEMPLATE INDEX,
+                # not the template value.
+                "duration_index": int(
+                    duration_index
                 ),
+
+                # Keep actual quantized duration
+                # separately for temporal extent.
+                "duration_steps": int(
+                    duration_steps
+                ),
+
                 "velocity": int(
                     velocity
                 ),
+
                 "program": int(
                     program
                 ),
@@ -650,10 +607,6 @@ def build_song_tensor(
     dtype:
 
         torch.long
-
-    The long dtype is mandatory because valid CP durations include:
-
-        256 ... 4096
     """
 
     import torch
@@ -677,6 +630,16 @@ def build_song_tensor(
         accompaniment,
     )
 
+    # ------------------------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Song length is based on the actual CP position of the note END,
+    # NOT on the duration-template index.
+    #
+    # This prevents the old bug where a duration index such as 23 could
+    # accidentally be interpreted as 23 CP steps.
+    # ------------------------------------------------------------------------
+
     song_length = 0
 
     for notes in tracks:
@@ -684,8 +647,8 @@ def build_song_tensor(
         for note in notes:
 
             note_end = (
-                note["start"]
-                + note["duration"]
+                int(note["start"])
+                + int(note["duration_steps"])
             )
 
             if note_end > song_length:
@@ -730,13 +693,20 @@ def build_song_tensor(
             ):
                 continue
 
-            # Same ordering as original CP preprocessing.
+            # Same ordering as the original CP preprocessing:
+            #
+            # primary   = velocity
+            # secondary = program
+            # tertiary  = pitch
+            # quaternary= duration
+            #
+            # np.lexsort((duration, pitch, program, velocity))
             onset_notes.sort(
                 key=lambda note: (
                     note["velocity"],
                     note["program"],
                     note["pitch"],
-                    note["duration"],
+                    note["duration_index"],
                 )
             )
 
@@ -767,10 +737,12 @@ def build_song_tensor(
                     base + 1
                 ] = note["pitch"]
 
+                # IMPORTANT:
+                # duration field = template INDEX
                 song[
                     start,
                     base + 2
-                ] = note["duration"]
+                ] = note["duration_index"]
 
                 song[
                     start,
@@ -804,6 +776,200 @@ def build_song_tensor(
 
 
 # ============================================================================
+# VALIDATE ONE SONG
+# ============================================================================
+
+def validate_song_tensor(song):
+    """
+    Validate the CP representation before it is allowed into the corpus.
+
+    This catches representation mistakes early.
+    """
+
+    import torch
+
+    if song is None:
+        raise RuntimeError(
+            "Song tensor is None"
+        )
+
+    if song.ndim != 2:
+        raise RuntimeError(
+            f"Invalid tensor rank: "
+            f"{tuple(song.shape)}"
+        )
+
+    if song.shape[1] != SUBSEQ_LENGTH:
+        raise RuntimeError(
+            f"Invalid tensor width: "
+            f"{tuple(song.shape)}"
+        )
+
+    if song.dtype != torch.long:
+        raise RuntimeError(
+            f"Invalid tensor dtype: "
+            f"{song.dtype}"
+        )
+
+    if song.numel() == 0:
+        raise RuntimeError(
+            "Empty song tensor"
+        )
+
+    # ------------------------------------------------------------
+    # Validate every field independently.
+    #
+    # Layout:
+    #
+    #   program, pitch, duration_index, velocity
+    # ------------------------------------------------------------
+
+    reshaped = song.view(
+        song.shape[0],
+        TRACK_COUNT,
+        MAX_POLYPHONY,
+        FIELDS_PER_NOTE,
+    )
+
+    programs = reshaped[:, :, :, 0]
+    pitches = reshaped[:, :, :, 1]
+    durations = reshaped[:, :, :, 2]
+    velocities = reshaped[:, :, :, 3]
+
+    # Padding/EOS occupy the program field.
+    valid_program_mask = (
+        (programs == PAD_VALUE)
+        | (programs == EOS_VALUE)
+        | (
+            (
+                programs >= 0
+            )
+            & (
+                programs <= 127
+            )
+        )
+    )
+
+    if not bool(
+        torch.all(valid_program_mask)
+    ):
+        raise RuntimeError(
+            "Invalid program value detected"
+        )
+
+    valid_pitch_mask = (
+        (pitches == PAD_VALUE)
+        | (
+            (pitches >= MIN_PITCH)
+            & (pitches <= MAX_PITCH)
+        )
+    )
+
+    if not bool(
+        torch.all(valid_pitch_mask)
+    ):
+        raise RuntimeError(
+            "Invalid pitch value detected"
+        )
+
+    # Duration is now an INDEX 0..23.
+    #
+    # Padding is 255.
+    # EOS slots are initialized as padding, except their program field.
+    valid_duration_mask = (
+        (durations == PAD_VALUE)
+        | (
+            (durations >= 0)
+            & (
+                durations
+                < len(DURATION_TEMPLATES)
+            )
+        )
+    )
+
+    if not bool(
+        torch.all(valid_duration_mask)
+    ):
+        bad = durations[
+            ~valid_duration_mask
+        ]
+
+        raise RuntimeError(
+            "Invalid duration-template index "
+            f"detected. First bad values: "
+            f"{bad[:20].tolist()}"
+        )
+
+    valid_velocity_mask = (
+        (velocities == PAD_VALUE)
+        | (
+            (velocities >= 0)
+            & (velocities <= 127)
+        )
+    )
+
+    if not bool(
+        torch.all(valid_velocity_mask)
+    ):
+        raise RuntimeError(
+            "Invalid velocity value detected"
+        )
+
+
+# ============================================================================
+# PITCH SHIFT RANGE
+# ============================================================================
+
+def calculate_pitch_shift_range(
+    melody_notes,
+    accompaniment_notes,
+):
+    pitches = []
+
+    for notes in (
+        melody_notes,
+        accompaniment_notes,
+    ):
+
+        for note in notes:
+
+            if (
+                int(note["channel"])
+                == GM_DRUM_CHANNEL
+            ):
+                continue
+
+            pitch = int(
+                note["pitch"]
+            )
+
+            if (
+                MIN_PITCH
+                <= pitch
+                <= MAX_PITCH
+            ):
+                pitches.append(
+                    pitch
+                )
+
+    if not pitches:
+        return None
+
+    minimum_pitch = min(
+        pitches
+    )
+
+    maximum_pitch = max(
+        pitches
+    )
+
+    return (
+        -minimum_pitch,
+        127 - maximum_pitch,
+    )
+
+
+# ============================================================================
 # ONE MIDI -> TEMPORARY SONG
 # ============================================================================
 
@@ -813,30 +979,25 @@ def preprocess_one_midi_worker(
     """
     Worker entry point.
 
-    Input:
+    The worker writes the large tensor to disk.
 
-        (
-            input_index,
-            midi_path,
-            staging_dir
-        )
-
-    Output is deliberately small:
-
-        metadata dictionary
-
-    The large tensor stays on disk.
+    Only lightweight metadata is returned to the parent.
     """
 
     import torch
 
-    input_index, midi_path, staging_dir = (
-        task
-    )
+    (
+        input_index,
+        midi_path,
+        staging_dir,
+    ) = task
 
     midi_path = Path(
         midi_path
     )
+
+    midi = None
+    song = None
 
     try:
 
@@ -886,6 +1047,25 @@ def preprocess_one_midi_worker(
             )
         )
 
+        pitch_range = (
+            calculate_pitch_shift_range(
+                melody_notes,
+                accompaniment_notes,
+            )
+        )
+
+        if pitch_range is None:
+
+            return {
+                "ok": False,
+                "index": input_index,
+                "path": str(
+                    midi_path
+                ),
+                "reason":
+                    "no_non_drum_pitches",
+            }
+
         song = build_song_tensor(
             melody_notes,
             accompaniment_notes,
@@ -904,92 +1084,17 @@ def preprocess_one_midi_worker(
                     "no_usable_notes",
             }
 
-        if song.ndim != 2:
+        # ------------------------------------------------------------
+        # CRITICAL VALIDATION
+        # ------------------------------------------------------------
 
-            raise RuntimeError(
-                "Internal tensor rank error: "
-                f"{tuple(song.shape)}"
-            )
-
-        if (
-            song.shape[1]
-            != SUBSEQ_LENGTH
-        ):
-
-            raise RuntimeError(
-                "Internal tensor width error: "
-                f"{tuple(song.shape)}"
-            )
-
-        if song.dtype != torch.long:
-
-            raise RuntimeError(
-                "Internal tensor dtype error: "
-                f"{song.dtype}"
-            )
-
-        pitches = []
-
-        for notes in (
-            melody_notes,
-            accompaniment_notes,
-        ):
-
-            for note in notes:
-
-                if (
-                    int(note["channel"])
-                    == GM_DRUM_CHANNEL
-                ):
-                    continue
-
-                pitch = int(
-                    note["pitch"]
-                )
-
-                if (
-                    MIN_PITCH
-                    <= pitch
-                    <= MAX_PITCH
-                ):
-
-                    pitches.append(
-                        pitch
-                    )
-
-        if not pitches:
-
-            return {
-                "ok": False,
-                "index": input_index,
-                "path": str(
-                    midi_path
-                ),
-                "reason":
-                    "no_non_drum_pitches",
-            }
-
-        minimum_pitch = min(
-            pitches
+        validate_song_tensor(
+            song
         )
 
-        maximum_pitch = max(
-            pitches
-        )
-
-        pitch_shift_min = (
-            -minimum_pitch
-        )
-
-        pitch_shift_max = (
-            127 - maximum_pitch
-        )
-
-        # --------------------------------------------------------------
-        # One temporary file per song.
-        #
-        # The parent receives only this path, not the tensor itself.
-        # --------------------------------------------------------------
+        # ------------------------------------------------------------
+        # Temporary worker output
+        # ------------------------------------------------------------
 
         staging_dir = Path(
             staging_dir
@@ -1010,12 +1115,25 @@ def preprocess_one_midi_worker(
             temp_path,
         )
 
-        # Explicitly release the tensor before the worker is reused.
         length = int(
             song.shape[0]
         )
 
+        pitch_shift_min, pitch_shift_max = (
+            pitch_range
+        )
+
+        melody_note_count = len(
+            melody_notes
+        )
+
+        accompaniment_note_count = len(
+            accompaniment_notes
+        )
+
         del song
+        song = None
+
         gc.collect()
 
         return {
@@ -1028,20 +1146,16 @@ def preprocess_one_midi_worker(
                 temp_path
             ),
             "length": length,
-            "pitch_shift_min":
-                int(
-                    pitch_shift_min
-                ),
-            "pitch_shift_max":
-                int(
-                    pitch_shift_max
-                ),
+            "pitch_shift_min": int(
+                pitch_shift_min
+            ),
+            "pitch_shift_max": int(
+                pitch_shift_max
+            ),
             "melody_notes":
-                len(melody_notes),
+                melody_note_count,
             "accompaniment_notes":
-                len(
-                    accompaniment_notes
-                ),
+                accompaniment_note_count,
             "ticks_per_beat":
                 ticks_per_beat,
         }
@@ -1062,10 +1176,8 @@ def preprocess_one_midi_worker(
 
     finally:
 
-        try:
-            midi = None
-        except Exception:
-            pass
+        midi = None
+        song = None
 
         gc.collect()
 
@@ -1078,7 +1190,7 @@ def find_stage4_midis(
     input_root,
 ):
     """
-    Discover Stage 4 files in deterministic order.
+    Discover Stage 4 MIDI files in deterministic order.
     """
 
     input_root = Path(
@@ -1136,6 +1248,12 @@ def atomic_torch_save(
     obj,
     path,
 ):
+    """
+    Atomically save a torch object.
+    """
+
+    import torch
+
     path = Path(
         path
     )
@@ -1146,13 +1264,10 @@ def atomic_torch_save(
     )
 
     temp = path.with_suffix(
-        path.suffix
-        + ".tmp"
+        path.suffix + ".tmp"
     )
 
     try:
-
-        import torch
 
         torch.save(
             obj,
@@ -1175,7 +1290,7 @@ def atomic_torch_save(
 
 
 # ============================================================================
-# PROGRESS DISPLAY
+# FORMAT HELPERS
 # ============================================================================
 
 def format_seconds(
@@ -1184,14 +1299,198 @@ def format_seconds(
     if seconds < 60:
         return f"{seconds:.0f}s"
 
-    minutes = seconds / 60
+    minutes = (
+        seconds / 60
+    )
 
     if minutes < 60:
         return f"{minutes:.1f}m"
 
-    hours = minutes / 60
+    hours = (
+        minutes / 60
+    )
 
     return f"{hours:.1f}h"
+
+
+def format_bytes(
+    value,
+):
+    value = float(
+        value
+    )
+
+    units = (
+        "B",
+        "KiB",
+        "MiB",
+        "GiB",
+        "TiB",
+    )
+
+    for unit in units:
+
+        if value < 1024.0:
+            return (
+                f"{value:.2f} {unit}"
+            )
+
+        value /= 1024.0
+
+    return (
+        f"{value:.2f} PiB"
+    )
+
+
+# ============================================================================
+# FINAL DATASET VALIDATION
+# ============================================================================
+
+def validate_final_dataset(
+    data_path,
+    length_path,
+    pitch_shift_path,
+    expected_song_count,
+):
+    """
+    Reload the final dataset and perform structural checks.
+
+    This is deliberately performed before the script declares success.
+    """
+
+    import torch
+
+    print()
+    print(
+        "Validating final dataset..."
+    )
+
+    data = torch.load(
+        data_path,
+        weights_only=True,
+    )
+
+    lengths = torch.load(
+        length_path,
+        weights_only=True,
+    )
+
+    pitch_ranges = torch.load(
+        pitch_shift_path,
+        weights_only=True,
+    )
+
+    if data.dtype != torch.long:
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            f"dataset dtype is {data.dtype}"
+        )
+
+    if data.ndim != 2:
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            f"dataset shape is "
+            f"{tuple(data.shape)}"
+        )
+
+    if data.shape[1] != SUBSEQ_LENGTH:
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            f"dataset width is "
+            f"{data.shape[1]}"
+        )
+
+    if len(lengths) != expected_song_count:
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            f"{len(lengths)} lengths for "
+            f"{expected_song_count} songs"
+        )
+
+    pitch_ranges = pitch_ranges.reshape(
+        -1,
+        2,
+    )
+
+    if len(pitch_ranges) != expected_song_count:
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            f"{len(pitch_ranges)} pitch ranges for "
+            f"{expected_song_count} songs"
+        )
+
+    if int(
+        lengths.sum().item()
+    ) != int(
+        data.shape[0]
+    ):
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            "sum(lengths) != data.shape[0]"
+        )
+
+    # Validate duration indices globally.
+    #
+    # This is potentially expensive over 34M rows, but it is performed
+    # once at the very end and guarantees that the corpus cannot silently
+    # contain the old actual-duration representation.
+
+    reshaped = data.view(
+        data.shape[0],
+        TRACK_COUNT,
+        MAX_POLYPHONY,
+        FIELDS_PER_NOTE,
+    )
+
+    duration_values = (
+        reshaped[:, :, :, 2]
+    )
+
+    valid_duration_mask = (
+        (duration_values == PAD_VALUE)
+        |
+        (
+            (duration_values >= 0)
+            &
+            (
+                duration_values
+                < len(DURATION_TEMPLATES)
+            )
+        )
+    )
+
+    if not bool(
+        torch.all(
+            valid_duration_mask
+        )
+    ):
+
+        bad = duration_values[
+            ~valid_duration_mask
+        ]
+
+        raise RuntimeError(
+            "FINAL VALIDATION FAILED: "
+            "invalid duration-template indices. "
+            f"First bad values: "
+            f"{bad[:20].tolist()}"
+        )
+
+    print(
+        "Final validation: OK"
+    )
+
+    del data
+    del lengths
+    del pitch_ranges
+
+    gc.collect()
 
 
 # ============================================================================
@@ -1211,84 +1510,55 @@ def main():
         "--input",
         type=Path,
         default=DEFAULT_INPUT_ROOT,
-        help=(
-            "Stage 4 MIDI root "
-            f"(default: {DEFAULT_INPUT_ROOT})"
-        ),
     )
 
     parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
-        help=(
-            "Output directory "
-            f"(default: {DEFAULT_OUTPUT_ROOT})"
-        ),
     )
 
     parser.add_argument(
         "--dataset-name",
         type=str,
         default=DEFAULT_DATASET_NAME,
-        help=(
-            "Dataset basename "
-            f"(default: {DEFAULT_DATASET_NAME})"
-        ),
     )
 
     parser.add_argument(
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
-        help=(
-            "Number of preprocessing workers "
-            f"(default: {DEFAULT_WORKERS})"
-        ),
     )
 
     parser.add_argument(
         "--maxtasksperchild",
         type=int,
         default=DEFAULT_MAX_TASKS_PER_CHILD,
-        help=(
-            "Tasks handled by each worker before "
-            "replacement "
-            f"(default: "
-            f"{DEFAULT_MAX_TASKS_PER_CHILD})"
-        ),
     )
 
     parser.add_argument(
         "--staging-dir",
         type=Path,
         default=None,
-        help=(
-            "Temporary staging directory. "
-            "If omitted, a temporary directory is "
-            "created under the output directory."
-        ),
     )
 
     args = parser.parse_args()
 
     if args.workers <= 0:
-
         raise ValueError(
             "--workers must be > 0"
         )
 
     if args.maxtasksperchild <= 0:
-
         raise ValueError(
             "--maxtasksperchild must be > 0"
         )
 
-    input_root = (
+    input_root = Path(
         args.input
     )
 
-    output_root = (
+    output_root = Path(
         args.output
     )
 
@@ -1301,12 +1571,9 @@ def main():
         exist_ok=True,
     )
 
-    # ------------------------------------------------------------------
-    # Staging directory.
-    #
-    # Keeping it under output/ makes it obvious what belongs to this
-    # preprocessing run and also avoids surprises with /tmp space.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Staging directory
+    # ------------------------------------------------------------------------
 
     if args.staging_dir is None:
 
@@ -1320,26 +1587,19 @@ def main():
 
     else:
 
-        staging_root = (
+        staging_root = Path(
             args.staging_dir
         )
 
     if staging_root.exists():
 
-        print()
-        print(
-            "WARNING: staging directory already exists:"
-        )
-        print(
-            f"    {staging_root}"
-        )
-        print()
-
-        # It is safer to refuse than to accidentally mix the results
-        # of two preprocessing runs.
         raise RuntimeError(
-            "Staging directory already exists. "
-            "Remove it manually before starting a new run."
+            "Staging directory already exists:\n"
+            f"    {staging_root}\n\n"
+            "This script deliberately refuses to mix "
+            "partial runs.\n"
+            "Remove that directory before starting "
+            "a fresh preprocessing run."
         )
 
     staging_root.mkdir(
@@ -1347,9 +1607,9 @@ def main():
         exist_ok=True,
     )
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
     # Banner
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
 
     print()
     print(
@@ -1359,7 +1619,7 @@ def main():
         "STAGE 4 -> CP16 PREPROCESSING"
     )
     print(
-        "PARALLEL VERSION"
+        "PARALLEL / MEMORY-SAFE / CORRECTED DURATION INDEX"
     )
     print(
         "=" * 78
@@ -1398,23 +1658,19 @@ def main():
     )
 
     print(
-        f"max_polyphony    : "
-        f"{MAX_POLYPHONY}"
+        f"tracks           : {TRACK_COUNT}"
     )
 
     print(
-        f"tracks           : "
-        f"{TRACK_COUNT}"
+        f"max_polyphony    : {MAX_POLYPHONY}"
     )
 
     print(
-        f"fields/note      : "
-        f"{FIELDS_PER_NOTE}"
+        f"fields/note      : {FIELDS_PER_NOTE}"
     )
 
     print(
-        f"tensor width     : "
-        f"{SUBSEQ_LENGTH}"
+        f"tensor width     : {SUBSEQ_LENGTH}"
     )
 
     print()
@@ -1437,7 +1693,31 @@ def main():
     )
 
     print(
+        "Duration field   : TEMPLATE INDEX 0..23"
+    )
+
+    print(
+        "Duration values  : "
+        f"{DURATION_TEMPLATES[0]}.."
+        f"{DURATION_TEMPLATES[-1]}"
+    )
+
+    print(
+        "Padding          : "
+        f"{PAD_VALUE}"
+    )
+
+    print(
+        "EOS program      : "
+        f"{EOS_VALUE}"
+    )
+
+    print(
         "UglyMIDI         : NO"
+    )
+
+    print(
+        "pretty_midi      : NO"
     )
 
     print(
@@ -1450,9 +1730,9 @@ def main():
 
     print()
 
-    # ------------------------------------------------------------------
-    # Discover files.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Discover files
+    # ------------------------------------------------------------------------
 
     midi_files = find_stage4_midis(
         input_root
@@ -1475,19 +1755,9 @@ def main():
             "No Stage 4 MIDI files were found."
         )
 
-    # ------------------------------------------------------------------
-    # Create worker tasks.
-    #
-    # IMPORTANT:
-    #
-    # The task contains only:
-    #
-    #     index
-    #     path
-    #     staging directory
-    #
-    # No MIDI data or tensors are sent from the parent.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Worker tasks
+    # ------------------------------------------------------------------------
 
     tasks = (
         (
@@ -1505,21 +1775,15 @@ def main():
 
     rejected = []
 
-    successful = 0
-
     completed = 0
+
+    successful = 0
 
     start_time = time.monotonic()
 
-    # ------------------------------------------------------------------
-    # multiprocessing
-    #
-    # "spawn" is safest across platforms and avoids inheriting unwanted
-    # PyTorch state.
-    #
-    # On Linux, fork is faster to start, but workers import almost
-    # nothing expensive here. Spawn provides safer isolation.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Multiprocessing
+    # ------------------------------------------------------------------------
 
     context = mp.get_context(
         "spawn"
@@ -1549,37 +1813,7 @@ def main():
 
                 completed += 1
 
-                if not result["ok"]:
-
-                    rejected.append(
-                        result
-                    )
-
-                    if (
-                        completed <= 20
-                        or completed % 100 == 0
-                    ):
-
-                        print(
-                            f"[{completed:>7,}/"
-                            f"{total_files:,}] "
-                            f"REJECT "
-                            f"{result['path']} "
-                            f"("
-                            f"{result['reason']}"
-                            f")"
-                        )
-
-                        if result.get(
-                            "error"
-                        ):
-
-                            print(
-                                "    ERROR: "
-                                f"{result['error']}"
-                            )
-
-                else:
+                if result["ok"]:
 
                     results.append(
                         result
@@ -1587,15 +1821,16 @@ def main():
 
                     successful += 1
 
-                # --------------------------------------------------
-                # Progress.
-                # --------------------------------------------------
+                else:
+
+                    rejected.append(
+                        result
+                    )
 
                 if (
                     completed == 1
-                    or completed % 100 == 0
-                    or completed
-                    == total_files
+                    or completed % 250 == 0
+                    or completed == total_files
                 ):
 
                     elapsed = (
@@ -1621,211 +1856,133 @@ def main():
                         else 0
                     )
 
-                    total_steps = sum(
-                        int(
-                            r["length"]
-                        )
-                        for r in results
+                    print(
+                        f"\rProcessed "
+                        f"{completed:,}/"
+                        f"{total_files:,} "
+                        f"({completed / total_files * 100:6.2f}%) "
+                        f"| OK {successful:,} "
+                        f"| rejected {len(rejected):,} "
+                        f"| {rate:.1f}/s "
+                        f"| ETA {format_seconds(eta)}",
+                        end="",
+                        flush=True,
                     )
 
-                    print(
-                        f"[{completed:>7,}/"
-                        f"{total_files:,}] "
-                        f"done="
-                        f"{successful:,} "
-                        f"rejected="
-                        f"{len(rejected):,} "
-                        f"CP="
-                        f"{total_steps:,} "
-                        f"rate="
-                        f"{rate:.1f}/s "
-                        f"ETA="
-                        f"{format_seconds(eta)}"
-                    )
+        print()
+        print()
 
     except KeyboardInterrupt:
 
         print()
         print(
-            "=" * 78
-        )
-        print(
-            "INTERRUPTED"
-        )
-        print(
-            "=" * 78
-        )
-        print()
-
-        print(
-            "Terminating workers..."
+            "Interrupted."
         )
 
         raise
 
-    except Exception:
+    # ------------------------------------------------------------------------
+    # Deterministic ordering
+    # ------------------------------------------------------------------------
 
-        print()
-        print(
-            "Worker pool failed."
-        )
-
-        raise
-
-    # ------------------------------------------------------------------
-    # Ensure all expected successful staging files exist.
-    # ------------------------------------------------------------------
-
-    print()
-    print(
-        "Worker preprocessing complete."
+    results.sort(
+        key=lambda item:
+            item["index"]
     )
 
-    print()
+    # ------------------------------------------------------------------------
+    # Report rejections
+    # ------------------------------------------------------------------------
 
-    missing = []
+    if rejected:
+
+        print(
+            f"Rejected {len(rejected):,} files:"
+        )
+
+        for item in rejected[:20]:
+
+            print(
+                f"  {item['path']}"
+            )
+
+            print(
+                f"      {item.get('reason', 'unknown')}"
+            )
+
+            if "error" in item:
+
+                print(
+                    f"      {item['error']}"
+                )
+
+        if len(rejected) > 20:
+
+            print(
+                f"  ... and "
+                f"{len(rejected) - 20:,} more"
+            )
+
+        print()
+
+    if not results:
+
+        raise RuntimeError(
+            "No MIDI files were successfully converted."
+        )
+
+    # ------------------------------------------------------------------------
+    # Prepare final metadata
+    # ------------------------------------------------------------------------
+
+    import torch
+
+    song_lengths = []
+
+    pitch_shift_ranges = []
+
+    manifest_lines = []
+
+    total_cp_steps = 0
 
     for result in results:
 
-        temp_path = Path(
-            result["temp_path"]
+        length = int(
+            result["length"]
         )
 
-        if not temp_path.is_file():
+        song_lengths.append(
+            length
+        )
 
-            missing.append(
-                result
+        pitch_shift_ranges.append(
+            [
+                int(
+                    result[
+                        "pitch_shift_min"
+                    ]
+                ),
+                int(
+                    result[
+                        "pitch_shift_max"
+                    ]
+                ),
+            ]
+        )
+
+        total_cp_steps += length
+
+        manifest_lines.append(
+            (
+                f"{len(manifest_lines)}\t"
+                f"{os.path.relpath(result['path'], input_root)}"
+                "\n"
             )
-
-    if missing:
-
-        raise RuntimeError(
-            "Missing worker staging files: "
-            f"{len(missing)}"
         )
 
-    # ------------------------------------------------------------------
-    # Sort successful results by original MIDI order.
-    #
-    # imap_unordered() gives us parallel throughput.
-    # Sorting here restores deterministic dataset order.
-    # ------------------------------------------------------------------
-
-    results.sort(
-        key=lambda r:
-            r["index"]
-    )
-
-    # ------------------------------------------------------------------
-    # Build metadata arrays.
-    # ------------------------------------------------------------------
-
-    lengths = [
-        int(
-            r["length"]
-        )
-        for r in results
-    ]
-
-    pitch_ranges = [
-        [
-            int(
-                r["pitch_shift_min"]
-            ),
-            int(
-                r["pitch_shift_max"]
-            ),
-        ]
-        for r in results
-    ]
-
-    manifest = []
-
-    for output_index, result in enumerate(
-        results
-    ):
-
-        midi_path = Path(
-            result["path"]
-        )
-
-        manifest.append(
-            {
-                "index": output_index,
-                "input_index": int(
-                    result["index"]
-                ),
-                "path": str(
-                    midi_path.relative_to(
-                        input_root
-                    )
-                ),
-                "length": int(
-                    result["length"]
-                ),
-                "pitch_shift_min":
-                    int(
-                        result[
-                            "pitch_shift_min"
-                        ]
-                    ),
-                "pitch_shift_max":
-                    int(
-                        result[
-                            "pitch_shift_max"
-                        ]
-                    ),
-                "melody_notes":
-                    int(
-                        result[
-                            "melody_notes"
-                        ]
-                    ),
-                "accompaniment_notes":
-                    int(
-                        result[
-                            "accompaniment_notes"
-                        ]
-                    ),
-                "ticks_per_beat":
-                    int(
-                        result[
-                            "ticks_per_beat"
-                        ]
-                    ),
-            }
-        )
-
-    # ------------------------------------------------------------------
-    # Total tensor size.
-    # ------------------------------------------------------------------
-
-    total_cp_steps = sum(
-        lengths
-    )
-
-    print(
-        f"Successful songs : "
-        f"{len(results):,}"
-    )
-
-    print(
-        f"Rejected files   : "
-        f"{len(rejected):,}"
-    )
-
-    print(
-        f"Total CP steps   : "
-        f"{total_cp_steps:,}"
-    )
-
-    # ------------------------------------------------------------------
-    # Estimate final RAM requirement.
-    #
-    # torch.long = 8 bytes.
-    #
-    # This is useful because the final .pt is one contiguous tensor.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Estimate final tensor RAM
+    # ------------------------------------------------------------------------
 
     final_bytes = (
         total_cp_steps
@@ -1833,41 +1990,49 @@ def main():
         * 8
     )
 
-    final_gib = (
-        final_bytes
-        / (1024 ** 3)
+    print(
+        "Assembly:"
     )
 
     print(
-        f"Final tensor RAM : "
-        f"{final_gib:.2f} GiB"
+        f"  Successful songs : "
+        f"{len(results):,}"
+    )
+
+    print(
+        f"  Total CP steps   : "
+        f"{total_cp_steps:,}"
+    )
+
+    print(
+        f"  Tensor shape     : "
+        f"({total_cp_steps}, "
+        f"{SUBSEQ_LENGTH})"
+    )
+
+    print(
+        f"  Tensor dtype     : "
+        f"torch.int64"
+    )
+
+    print(
+        f"  Final tensor RAM : "
+        f"{format_bytes(final_bytes)}"
     )
 
     print()
 
-    # ------------------------------------------------------------------
-    # Allocate final tensor.
+    # ------------------------------------------------------------------------
+    # Allocate final tensor ONCE.
     #
-    # This is the only intentionally large parent-side allocation.
+    # This avoids:
     #
-    # We do NOT use:
+    #     torch.cat(list_of_18k_tensors)
     #
-    #     torch.cat(list_of_20k_tensors)
-    #
-    # because that would require all individual tensors to remain alive
-    # simultaneously and would create unnecessary peak RAM usage.
-    #
-    # Instead, allocate the final tensor once and fill it sequentially
-    # from the worker staging files.
-    # ------------------------------------------------------------------
+    # and therefore avoids a large temporary peak.
+    # ------------------------------------------------------------------------
 
-    import torch
-
-    print(
-        "Allocating final tensor..."
-    )
-
-    data = torch.empty(
+    final_data = torch.empty(
         (
             total_cp_steps,
             SUBSEQ_LENGTH,
@@ -1875,26 +2040,9 @@ def main():
         dtype=torch.long,
     )
 
-    print(
-        "Final tensor allocated."
-    )
-
-    print()
-
-    # ------------------------------------------------------------------
-    # Assemble.
-    # ------------------------------------------------------------------
-
     offset = 0
 
-    assembly_start = (
-        time.monotonic()
-    )
-
-    for position, result in enumerate(
-        results,
-        start=1,
-    ):
+    for result in results:
 
         temp_path = Path(
             result["temp_path"]
@@ -1905,184 +2053,45 @@ def main():
             weights_only=True,
         )
 
-        expected_length = int(
-            result["length"]
+        # Defensive validation one final time.
+        validate_song_tensor(
+            song
         )
 
-        if song.dtype != torch.long:
-
-            raise RuntimeError(
-                f"Unexpected dtype in "
-                f"{temp_path}: "
-                f"{song.dtype}"
-            )
-
-        if song.ndim != 2:
-
-            raise RuntimeError(
-                f"Unexpected shape in "
-                f"{temp_path}: "
-                f"{tuple(song.shape)}"
-            )
-
-        if (
+        length = int(
             song.shape[0]
-            != expected_length
-        ):
-
-            raise RuntimeError(
-                f"Length mismatch in "
-                f"{temp_path}: "
-                f"metadata="
-                f"{expected_length}, "
-                f"tensor="
-                f"{song.shape[0]}"
-            )
-
-        if (
-            song.shape[1]
-            != SUBSEQ_LENGTH
-        ):
-
-            raise RuntimeError(
-                f"Width mismatch in "
-                f"{temp_path}: "
-                f"{tuple(song.shape)}"
-            )
-
-        end = (
-            offset
-            + expected_length
         )
 
-        data[
-            offset:end
-        ] = song
+        final_data[
+            offset:
+            offset + length
+        ].copy_(
+            song
+        )
 
-        offset = end
+        offset += length
 
         del song
 
-        # Immediately remove the staging tensor.
+        # Delete staging file immediately.
         try:
             temp_path.unlink()
         except OSError:
             pass
 
-        if (
-            position == 1
-            or position % 100 == 0
-            or position == len(results)
-        ):
-
-            elapsed = (
-                time.monotonic()
-                - assembly_start
-            )
-
-            rate = (
-                position
-                / elapsed
-                if elapsed > 0
-                else 0
-            )
-
-            remaining = (
-                len(results)
-                - position
-            )
-
-            eta = (
-                remaining / rate
-                if rate > 0
-                else 0
-            )
-
-            print(
-                f"[ASSEMBLY "
-                f"{position:>7,}/"
-                f"{len(results):,}] "
-                f"CP="
-                f"{offset:,} "
-                f"rate="
-                f"{rate:.1f}/s "
-                f"ETA="
-                f"{format_seconds(eta)}"
-            )
-
-    # ------------------------------------------------------------------
-    # Final sanity checks.
-    # ------------------------------------------------------------------
-
     if offset != total_cp_steps:
 
-        raise RuntimeError(
-            "Final assembly length mismatch: "
-            f"offset={offset}, "
-            f"expected={total_cp_steps}"
-        )
-
-    if data.ndim != 2:
+        del final_data
 
         raise RuntimeError(
-            "Final tensor rank mismatch: "
-            f"{tuple(data.shape)}"
+            "Assembly error: "
+            f"copied {offset} steps, "
+            f"expected {total_cp_steps}"
         )
 
-    if data.shape[1] != SUBSEQ_LENGTH:
-
-        raise RuntimeError(
-            "Final tensor width mismatch: "
-            f"{data.shape[1]} != "
-            f"{SUBSEQ_LENGTH}"
-        )
-
-    if data.dtype != torch.long:
-
-        raise RuntimeError(
-            "Final tensor dtype mismatch: "
-            f"{data.dtype}"
-        )
-
-    # ------------------------------------------------------------------
-    # Metadata tensors.
-    # ------------------------------------------------------------------
-
-    lengths_tensor = torch.tensor(
-        lengths,
-        dtype=torch.long,
-    )
-
-    pitch_shift_tensor = torch.tensor(
-        pitch_ranges,
-        dtype=torch.long,
-    )
-
-    if int(
-        lengths_tensor.sum().item()
-    ) != int(
-        data.shape[0]
-    ):
-
-        raise RuntimeError(
-            "length.pt does not describe "
-            "the final tensor correctly."
-        )
-
-    if pitch_shift_tensor.shape != (
-        len(results),
-        2,
-    ):
-
-        raise RuntimeError(
-            "pitch_shift_range.pt shape "
-            "mismatch: "
-            f"{tuple(pitch_shift_tensor.shape)}"
-        )
-
-    # ------------------------------------------------------------------
-    # Output paths.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Final paths
+    # ------------------------------------------------------------------------
 
     data_path = (
         output_root
@@ -2094,7 +2103,7 @@ def main():
         / f"{dataset_name}.length.pt"
     )
 
-    pitch_path = (
+    pitch_shift_path = (
         output_root
         / f"{dataset_name}.pitch_shift_range.pt"
     )
@@ -2109,186 +2118,224 @@ def main():
         / f"{dataset_name}.json"
     )
 
-    # ------------------------------------------------------------------
-    # Save final tensors.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Save final dataset
+    # ------------------------------------------------------------------------
 
-    print()
     print(
         "Saving final dataset..."
     )
 
     atomic_torch_save(
-        data,
+        final_data,
         data_path,
     )
 
+    del final_data
+
+    gc.collect()
+
+    # ------------------------------------------------------------------------
+    # Save lengths
+    # ------------------------------------------------------------------------
+
     atomic_torch_save(
-        lengths_tensor,
+        torch.tensor(
+            song_lengths,
+            dtype=torch.long,
+        ),
         length_path,
     )
 
+    # ------------------------------------------------------------------------
+    # Save pitch ranges
+    # ------------------------------------------------------------------------
+
     atomic_torch_save(
-        pitch_shift_tensor,
-        pitch_path,
+        torch.tensor(
+            pitch_shift_ranges,
+            dtype=torch.long,
+        ),
+        pitch_shift_path,
     )
 
-    # ------------------------------------------------------------------
-    # Save manifest.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Save manifest
+    # ------------------------------------------------------------------------
 
     with open(
         manifest_path,
         "w",
         encoding="utf-8",
-    ) as fh:
+    ) as handle:
 
-        for record in manifest:
+        handle.writelines(
+            manifest_lines
+        )
 
-            fh.write(
-                str(
-                    record["index"]
-                )
-                + "\t"
-                + str(
-                    record["path"]
-                )
-                + "\n"
-            )
+    # ------------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Save detailed JSON metadata.
-    # ------------------------------------------------------------------
+    elapsed = (
+        time.monotonic()
+        - start_time
+    )
 
     metadata = {
-        "dataset": (
-            "Los-Angeles-MIDI-Dataset-"
-            "Ver-4-0-CC-BY-NC-SA"
-        ),
-        "source": str(
-            input_root
-        ),
-        "preprocessing": (
-            "Stage 4 specific CP16 "
-            "parallel preprocessing"
-        ),
-        "uses_uglymidi": False,
+        "dataset_name":
+            dataset_name,
+
+        "input_root":
+            str(input_root),
+
+        "output_root":
+            str(output_root),
+
+        "source":
+            "Stage 4 MIDI corpus",
+
+        "stage4_is_authoritative":
+            True,
+
+        "uses_uglymidi":
+            False,
+
+        "uses_pretty_midi":
+            False,
+
         "uses_old_quantization_filter":
             False,
-        "workers": args.workers,
-        "maxtasksperchild":
-            args.maxtasksperchild,
-        "beat_div": BEAT_DIV,
+
+        "beat_div":
+            BEAT_DIV,
+
+        "cp_resolution":
+            "1/16 note",
+
+        "tracks":
+            TRACK_COUNT,
+
+        "track_semantics": {
+            "0": "melody",
+            "1": "accompaniment",
+        },
+
+        "programs": {
+            "melody":
+                MELODY_PROGRAM,
+            "accompaniment":
+                ACCOMPANIMENT_PROGRAM,
+        },
+
         "max_polyphony":
             MAX_POLYPHONY,
-        "track_count":
-            TRACK_COUNT,
+
         "fields_per_note":
             FIELDS_PER_NOTE,
+
         "tensor_width":
             SUBSEQ_LENGTH,
+
         "dtype":
-            "torch.long",
-        "melody_track":
-            0,
-        "accompaniment_track":
-            1,
-        "melody_program":
-            MELODY_PROGRAM,
-        "accompaniment_program":
-            ACCOMPANIMENT_PROGRAM,
-        "pad_value":
+            "torch.int64",
+
+        "padding_value":
             PAD_VALUE,
-        "eos_value":
+
+        "eos_program_value":
             EOS_VALUE,
+
+        "duration_representation":
+            "duration-template-index",
+
         "duration_templates":
             list(
                 DURATION_TEMPLATES
             ),
-        "file_count_input":
+
+        "duration_template_count":
+            len(
+                DURATION_TEMPLATES
+            ),
+
+        "duration_index_min":
+            0,
+
+        "duration_index_max":
+            len(
+                DURATION_TEMPLATES
+            ) - 1,
+
+        "worker_count":
+            args.workers,
+
+        "max_tasks_per_child":
+            args.maxtasksperchild,
+
+        "input_file_count":
             total_files,
-        "file_count_survived":
+
+        "converted_song_count":
             len(results),
-        "file_count_rejected":
+
+        "rejected_song_count":
             len(rejected),
-        "total_cp_steps":
-            int(
-                data.shape[0]
-            ),
-        "shape": [
-            int(
-                data.shape[0]
-            ),
-            int(
-                data.shape[1]
-            ),
+
+        "total_cp_timesteps":
+            total_cp_steps,
+
+        "tensor_shape": [
+            total_cp_steps,
+            SUBSEQ_LENGTH,
         ],
-        "final_tensor_bytes":
-            int(final_bytes),
-        "final_tensor_gib":
-            float(final_gib),
-        "songs":
-            manifest,
-        "rejections":
-            rejected,
+
+        "estimated_tensor_ram_bytes":
+            final_bytes,
+
+        "elapsed_seconds":
+            elapsed,
+
+        "rejected": rejected,
     }
 
     with open(
         metadata_path,
         "w",
         encoding="utf-8",
-    ) as fh:
+    ) as handle:
 
         json.dump(
             metadata,
-            fh,
+            handle,
             indent=2,
             ensure_ascii=False,
         )
 
-    # ------------------------------------------------------------------
-    # Cleanup staging directory.
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Final validation
+    # ------------------------------------------------------------------------
 
-    print()
-    print(
-        "Cleaning staging directory..."
+    validate_final_dataset(
+        data_path,
+        length_path,
+        pitch_shift_path,
+        len(results),
     )
 
-    try:
+    # ------------------------------------------------------------------------
+    # Remove staging directory
+    # ------------------------------------------------------------------------
+
+    if staging_root.exists():
 
         shutil.rmtree(
             staging_root
         )
 
-    except OSError as exc:
-
-        print(
-            "WARNING: Could not completely "
-            "remove staging directory:"
-        )
-
-        print(
-            f"    {exc}"
-        )
-
-    # ------------------------------------------------------------------
-    # Release auxiliary tensors.
-    # ------------------------------------------------------------------
-
-    del lengths_tensor
-    del pitch_shift_tensor
-
-    gc.collect()
-
-    # ------------------------------------------------------------------
-    # Final report.
-    # ------------------------------------------------------------------
-
-    total_elapsed = (
-        time.monotonic()
-        - start_time
-    )
+    # ------------------------------------------------------------------------
+    # COMPLETE
+    # ------------------------------------------------------------------------
 
     print()
     print(
@@ -2319,27 +2366,28 @@ def main():
 
     print(
         f"Total CP timesteps     : "
-        f"{data.shape[0]:,}"
+        f"{total_cp_steps:,}"
     )
 
     print(
         f"Tensor shape           : "
-        f"{tuple(data.shape)}"
+        f"({total_cp_steps}, "
+        f"{SUBSEQ_LENGTH})"
     )
 
     print(
         f"Tensor dtype           : "
-        f"{data.dtype}"
+        f"torch.int64"
     )
 
     print(
         f"Final tensor RAM       : "
-        f"{final_gib:.2f} GiB"
+        f"{format_bytes(final_bytes)}"
     )
 
     print(
         f"Total elapsed          : "
-        f"{format_seconds(total_elapsed)}"
+        f"{format_seconds(elapsed)}"
     )
 
     print()
@@ -2356,7 +2404,7 @@ def main():
 
     print(
         f"Pitch shift ranges     : "
-        f"{pitch_path}"
+        f"{pitch_shift_path}"
     )
 
     print(
@@ -2372,21 +2420,19 @@ def main():
     print()
 
     print(
-        "The dataset is ready for "
+        "Duration representation: "
+        "TEMPLATE INDEX 0..23"
+    )
+
+    print(
+        "Dataset is ready for "
         "OverlapFramedDataset."
     )
 
     print()
 
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
 if __name__ == "__main__":
-
-    # Required for multiprocessing with spawn.
     mp.freeze_support()
-
     main()
-
+    

@@ -1228,14 +1228,14 @@ def main():
     train_set_loader = DataLoader(
         train_dataset,
         batch_size=None,
-        num_workers=1,
+        num_workers=2,
         persistent_workers=True
     )
 
     val_set_loader = DataLoader(
         val_dataset,
         batch_size=None,
-        num_workers=1,
+        num_workers=2,
         persistent_workers=True
     )
 
