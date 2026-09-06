@@ -34,7 +34,7 @@ DEFAULT_SEED = 0
 #     0.15 = +/- 15% of a 16th note around every melody onset.
 #
 # This is deliberately expressed in musical time rather than milliseconds.
-DEFAULT_VICINITY = 0.475
+DEFAULT_VICINITY = 0.51
 
 # All output note velocities are forced to this value.
 OUTPUT_VELOCITY = 100
