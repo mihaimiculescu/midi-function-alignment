@@ -1148,17 +1148,66 @@ def chord_score(weights, root, typ):
 
     return float(score)
 
+def family_score(weights, root, typ):
+    """
+    Harmonic-family evidence used by the Viterbi decoder.
+
+    Major family:
+        maj / maj7 / dominant-7
+
+    Minor family:
+        min / min7
+
+    The decoder chooses the underlying harmonic family and root.
+    Exact seventh extensions are resolved only after harmonic
+    regions have been established.
+    """
+
+    if typ == "maj":
+        return max(
+            chord_score(weights, root, "maj"),
+            chord_score(weights, root, "maj7"),
+            chord_score(weights, root, "7"),
+        )
+
+    if typ == "min":
+        return max(
+            chord_score(weights, root, "min"),
+            chord_score(weights, root, "min7"),
+        )
+
+    return chord_score(
+        weights,
+        root,
+        typ,
+    )
 
 def all_chord_states():
     """
-    Complete decoder state space.
+    Harmonic-family decoder state space.
 
-    Do NOT prune to the local top-10 before Viterbi: a locally weaker chord
-    may be the globally coherent choice once future context is considered.
+    Seventh extensions are intentionally NOT separate temporal states.
+
+    The Viterbi decoder chooses among:
+
+        maj-family
+        min-family
+        dim
+        aug
+
+    for each of the 12 roots.
+
+    Exact maj / maj7 / 7 and min / min7 labels are resolved
+    after harmonic regions have been established.
     """
     result = []
 
-    for typ, _ in CHORD_TEMPLATES:
+    for typ in (
+        "maj",
+        "min",
+        "dim",
+        "aug",
+    ):
         for root in range(12):
             result.append({
                 "root": root,
@@ -1167,7 +1216,6 @@ def all_chord_states():
             })
 
     return result
-
 
 def _weighted_pitch_classes(intervals, start, end):
     weights = np.zeros(12, dtype=np.float64)
@@ -1813,7 +1861,7 @@ def build_decoder_evidence(
         key_confidences.append(key_confidence)
 
         for j, state in enumerate(chord_states):
-            local = chord_score(
+            local = family_score(
                 hop["weights"],
                 state["root"],
                 state["type"],
@@ -1972,7 +2020,7 @@ def decode_harmonic_sequence(
         )
 
         state["score"] = float(
-            chord_score(
+            family_score(
                 hops[hop_index]["weights"],
                 state["root"],
                 state["type"],
@@ -2107,7 +2155,7 @@ def refine_boundaries(
                 refined[j] = dict(new)
 
                 refined[j]["score"] = float(
-                    chord_score(
+                    family_score(
                         hops[j]["weights"],
                         new["root"],
                         new["type"],
@@ -2215,6 +2263,109 @@ def merge_regions(
             cleaned[i]["start"] = cleaned[i - 1]["end"]
 
     return cleaned
+
+def resolve_region_extensions(
+    regions,
+    hops,
+):
+    """
+    Resolve the concrete chord extension only AFTER harmonic
+    regions have been established.
+
+    This prevents:
+
+        Cm <-> Cm7
+        Eb <-> Ebmaj7
+        G <-> G7
+
+    from creating harmonic boundaries.
+
+    Evidence is accumulated across all analysis hops belonging
+    to the complete region.
+    """
+
+    resolved = []
+
+    for region in regions:
+        r = copy.deepcopy(region)
+
+        root = r["state"]["root"]
+        family = r["state"]["type"]
+        ids = r["ids"]
+
+        if family == "maj":
+            candidates = (
+                "maj",
+                "maj7",
+                "7",
+            )
+
+        elif family == "min":
+            candidates = (
+                "min",
+                "min7",
+            )
+
+        else:
+            # dim and aug already have a concrete identity.
+            concrete = family
+
+            scores = [
+                chord_score(
+                    hops[i]["weights"],
+                    root,
+                    concrete,
+                )
+                for i in ids
+            ]
+
+            r["state"]["type"] = concrete
+            r["state"]["label"] = chord_label(
+                root,
+                concrete,
+            )
+            r["state"]["score"] = float(
+                np.mean(scores)
+                if scores
+                else 0.0
+            )
+
+            resolved.append(r)
+            continue
+
+        best_type = None
+        best_score = -np.inf
+
+        for candidate in candidates:
+            scores = [
+                chord_score(
+                    hops[i]["weights"],
+                    root,
+                    candidate,
+                )
+                for i in ids
+            ]
+
+            score = float(
+                np.mean(scores)
+                if scores
+                else -np.inf
+            )
+
+            if score > best_score:
+                best_score = score
+                best_type = candidate
+
+        r["state"]["type"] = best_type
+        r["state"]["label"] = chord_label(
+            root,
+            best_type,
+        )
+        r["state"]["score"] = best_score
+
+        resolved.append(r)
+
+    return resolved
 
 def chord_intervals(typ):
     return dict(CHORD_TEMPLATES)[typ]
@@ -2838,11 +2989,17 @@ def generate(
             key_map,
         )
 
-        regions = merge_regions(
+        family_regions = merge_regions(
             hops,
             states,
             local_length,
         )
+
+        regions = resolve_region_extensions(
+            family_regions,
+            hops,
+        )
+
 
         print(f"  Final harmonic regions:     {len(regions)}")
         for r in regions:
