@@ -48,7 +48,7 @@ DEFAULT_VICINITY = 0.75
 
 OUTPUT_VELOCITY = 100
 MELODY_PROGRAM = 64
-CHORD_PROGRAM = 0
+CHORD_PROGRAM = 49
 CHORD_OCTAVE = 3
 
 MODEL_MAX_LENGTH = 384
@@ -59,16 +59,19 @@ MODEL_MAX_LENGTH = 384
 # MIN_REGION_STEPS = 16       # do not output 1/2-bar chord blips
 
 #TESTING
-SKELETON_WINDOW = 32
-SKELETON_HOP = 1
-MIN_STATE_HOPS = 1
-MIN_REGION_STEPS = 1
+SKELETON_WINDOW = 16
+SKELETON_HOP = 4
+MIN_STATE_HOPS = 2
+MIN_REGION_STEPS = 8
 
 
-# ROOT_CHANGE_PENALTY = 0.1
-ROOT_CHANGE_PENALTY = 0.01
+ROOT_CHANGE_PENALTY = 0.02
+# ROOT_CHANGE_PENALTY = 0.001
 # TYPE_CHANGE_PENALTY = 0.035
 TYPE_CHANGE_PENALTY = 0.07
+
+# New chord candidate/challenger must genuinely win, but not by an enormous amount
+STATE_CHANGE_MARGIN = 0.02
 
 LOWEST_OUTPUT_PITCH = 36    # C2
 HIGHEST_OUTPUT_PITCH = 67    # G4
@@ -229,77 +232,338 @@ def calculate_bar_ticks(resolution, numerator, denominator):
 
 
 def create_melody_chord_input(input_path, output_path, key):
-    source = pretty_midi.PrettyMIDI(input_path)
-    non_empty = [i for i in source.instruments if i.notes]
-    if len(non_empty) != 1:
-        raise ValueError(
-            "Input MIDI must contain exactly one non-empty melody track. "
-            f"Found {len(non_empty)}."
-        )
+    """
+    Create the synthetic two-track model-conditioning MIDI.
+
+    IMPORTANT:
+    The source melody is copied in MIDI TICKS, not via pretty_midi seconds.
+    This avoids PrettyMIDI's 120-BPM fallback changing the musical timing
+    when the source MIDI contains no tempo event.
+    """
+
+    source_mido = mido.MidiFile(input_path)
+    ticks_per_beat = source_mido.ticks_per_beat
 
     metadata = get_midi_metadata(input_path)
-    result = pretty_midi.PrettyMIDI(
-        resolution=source.resolution,
-        initial_tempo=metadata["bpm"],
-    )
-    result.time_signature_changes = copy.deepcopy(source.time_signature_changes)
-    result.key_signature_changes = copy.deepcopy(source.key_signature_changes)
 
-    melody = pretty_midi.Instrument(
-        program=non_empty[0].program,
-        is_drum=non_empty[0].is_drum,
-        name="Melody",
-    )
-    for n in non_empty[0].notes:
-        melody.notes.append(
-            pretty_midi.Note(OUTPUT_VELOCITY, n.pitch, n.start, n.end)
+    # ---------------------------------------------------------------
+    # Find exactly one source track containing note-on events.
+    # ---------------------------------------------------------------
+
+    note_track_indices = []
+
+    for track_index, track in enumerate(source_mido.tracks):
+        if any(
+            msg.type == "note_on" and msg.velocity > 0
+            for msg in track
+        ):
+            note_track_indices.append(track_index)
+
+    if len(note_track_indices) != 1:
+        raise ValueError(
+            "Input MIDI must contain exactly one non-empty melody track. "
+            f"Found {len(note_track_indices)}."
         )
-    result.instruments.append(melody)
 
-    chord = pretty_midi.Instrument(
-        program=CHORD_PROGRAM, is_drum=False, name=f"{key} prompt"
+    source_note_track = source_mido.tracks[note_track_indices[0]]
+
+    # ---------------------------------------------------------------
+    # Build a clean Type-1 MIDI.
+    # Track 0 = melody
+    # Track 1 = two-bar tonic prompt
+    # ---------------------------------------------------------------
+
+    result = mido.MidiFile(
+        type=1,
+        ticks_per_beat=ticks_per_beat,
     )
+
+    melody_track = mido.MidiTrack()
+    chord_track = mido.MidiTrack()
+
+    result.tracks.append(melody_track)
+    result.tracks.append(chord_track)
+
+    # ---------------------------------------------------------------
+    # Track 0 metadata.
+    # ---------------------------------------------------------------
+
+    melody_events = []
+
+    # Explicit tempo at tick 0 using the resolved BPM.
+    melody_events.append(
+        (
+            0,
+            0,
+            mido.MetaMessage(
+                "set_tempo",
+                tempo=mido.bpm2tempo(metadata["bpm"]),
+                time=0,
+            ),
+        )
+    )
+
+    # Preserve original time/key signatures at their exact ticks.
+    for track in source_mido.tracks:
+        absolute_tick = 0
+
+        for msg in track:
+            absolute_tick += msg.time
+
+            if msg.type in (
+                "time_signature",
+                "key_signature",
+            ):
+                melody_events.append(
+                    (
+                        absolute_tick,
+                        0,
+                        msg.copy(time=0),
+                    )
+                )
+
+    # Force melody Program 64.
+    melody_events.append(
+        (
+            0,
+            1,
+            mido.Message(
+                "program_change",
+                program=MELODY_PROGRAM,
+                channel=0,
+                time=0,
+            ),
+        )
+    )
+
+    # ---------------------------------------------------------------
+    # Copy melody notes at EXACT original absolute ticks.
+    # ---------------------------------------------------------------
+
+    absolute_tick = 0
+
+    for msg in source_note_track:
+        absolute_tick += msg.time
+
+        if msg.type == "note_on":
+            if msg.velocity > 0:
+                melody_events.append(
+                    (
+                        absolute_tick,
+                        2,
+                        mido.Message(
+                            "note_on",
+                            note=msg.note,
+                            velocity=OUTPUT_VELOCITY,
+                            channel=0,
+                            time=0,
+                        ),
+                    )
+                )
+            else:
+                melody_events.append(
+                    (
+                        absolute_tick,
+                        1,
+                        mido.Message(
+                            "note_off",
+                            note=msg.note,
+                            velocity=0,
+                            channel=0,
+                            time=0,
+                        ),
+                    )
+                )
+
+        elif msg.type == "note_off":
+            melody_events.append(
+                (
+                    absolute_tick,
+                    1,
+                    mido.Message(
+                        "note_off",
+                        note=msg.note,
+                        velocity=0,
+                        channel=0,
+                        time=0,
+                    ),
+                )
+            )
+
+    melody_events.sort(
+        key=lambda x: (
+            x[0],
+            x[1],
+        )
+    )
+
+    previous_tick = 0
+
+    for absolute_tick, _, msg in melody_events:
+        melody_track.append(
+            msg.copy(
+                time=absolute_tick - previous_tick
+            )
+        )
+        previous_tick = absolute_tick
+
+    melody_track.append(
+        mido.MetaMessage(
+            "end_of_track",
+            time=0,
+        )
+    )
+
+    # ---------------------------------------------------------------
+    # Track 1 = two-bar tonic prompt.
+    # ---------------------------------------------------------------
+
+    chord_track.append(
+        mido.Message(
+            "program_change",
+            program=CHORD_PROGRAM,
+            channel=1,
+            time=0,
+        )
+    )
+
     pitches = make_tonic_triad(key)
+
     bar_ticks = calculate_bar_ticks(
-        source.resolution,
+        ticks_per_beat,
         metadata["numerator"],
         metadata["denominator"],
     )
 
+    chord_events = []
+
     for bar in range(2):
-        st = source.tick_to_time(bar * bar_ticks)
-        en = source.tick_to_time((bar + 1) * bar_ticks)
+        start_tick = bar * bar_ticks
+        end_tick = (bar + 1) * bar_ticks
+
         for pitch in pitches:
-            chord.notes.append(
-                pretty_midi.Note(OUTPUT_VELOCITY, pitch, st, en)
+            chord_events.append(
+                (
+                    start_tick,
+                    1,
+                    mido.Message(
+                        "note_on",
+                        note=pitch,
+                        velocity=OUTPUT_VELOCITY,
+                        channel=1,
+                        time=0,
+                    ),
+                )
             )
 
-    result.instruments.append(chord)
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    result.write(output_path)
+            chord_events.append(
+                (
+                    end_tick,
+                    0,
+                    mido.Message(
+                        "note_off",
+                        note=pitch,
+                        velocity=0,
+                        channel=1,
+                        time=0,
+                    ),
+                )
+            )
+
+    chord_events.sort(
+        key=lambda x: (
+            x[0],
+            x[1],
+        )
+    )
+
+    previous_tick = 0
+
+    for absolute_tick, _, msg in chord_events:
+        chord_track.append(
+            msg.copy(
+                time=absolute_tick - previous_tick
+            )
+        )
+        previous_tick = absolute_tick
+
+    chord_track.append(
+        mido.MetaMessage(
+            "end_of_track",
+            time=0,
+        )
+    )
+
+    os.makedirs(
+        os.path.dirname(output_path) or ".",
+        exist_ok=True,
+    )
+
+    result.save(output_path)
+
     return metadata
 
 
 def get_original_melody(path):
-    source = pretty_midi.PrettyMIDI(path)
-    non_empty = [i for i in source.instruments if i.notes]
-    if len(non_empty) != 1:
+    """
+    Return the source melody as absolute-tick note events.
+
+    Timing is preserved exactly from the original MIDI.
+    """
+
+    midi = mido.MidiFile(path)
+
+    note_tracks = []
+
+    for track_index, track in enumerate(midi.tracks):
+        if any(
+            msg.type == "note_on" and msg.velocity > 0
+            for msg in track
+        ):
+            note_tracks.append(track_index)
+
+    if len(note_tracks) != 1:
         raise ValueError(
             "Input MIDI must contain exactly one non-empty melody track. "
-            f"Found {len(non_empty)}."
+            f"Found {len(note_tracks)}."
         )
 
-    melody = pretty_midi.Instrument(
-        program=non_empty[0].program,
-        is_drum=non_empty[0].is_drum,
-        name="Melody",
-    )
-    for n in non_empty[0].notes:
-        melody.notes.append(
-            pretty_midi.Note(OUTPUT_VELOCITY, n.pitch, n.start, n.end)
-        )
-    return melody
+    track = midi.tracks[note_tracks[0]]
 
+    events = []
+    absolute_tick = 0
+
+    for msg in track:
+        absolute_tick += msg.time
+
+        if msg.type == "note_on":
+            if msg.velocity > 0:
+                events.append(
+                    (
+                        absolute_tick,
+                        "note_on",
+                        int(msg.note),
+                    )
+                )
+            else:
+                events.append(
+                    (
+                        absolute_tick,
+                        "note_off",
+                        int(msg.note),
+                    )
+                )
+
+        elif msg.type == "note_off":
+            events.append(
+                (
+                    absolute_tick,
+                    "note_off",
+                    int(msg.note),
+                )
+            )
+
+    return events
 
 # ---------------------------------------------------------------------------
 # Model helpers
@@ -526,7 +790,7 @@ def select_harmonic_states(hops):
             continue
 
         # Hysteresis: a new label must have a meaningful local advantage.
-        if best["score"] - stay < 0.07:
+        if best["score"] - stay < STATE_CHANGE_MARGIN:
             states.append(dict(current))
             continue
 
@@ -563,71 +827,189 @@ def region_vector(region, hops):
 
 
 def merge_regions(hops, states, generation_length):
+    """
+    Convert per-hop harmonic states into contiguous, NON-OVERLAPPING
+    harmonic regions.
+
+    Important:
+    A hop's `end` is the end of its ANALYSIS WINDOW.  It is NOT the
+    end of the harmonic state.
+
+    Therefore region boundaries are defined by hop START positions.
+    """
+
     if not hops:
         return []
 
+    if len(hops) != len(states):
+        raise ValueError(
+            "hops/states length mismatch: "
+            f"{len(hops)} != {len(states)}"
+        )
+
+    # ---------------------------------------------------------------
+    # First create contiguous runs of identical harmonic states.
+    # ---------------------------------------------------------------
+
     regions = []
+
     cur = {
-        "start": hops[0]["start"],
-        "end": hops[0]["end"],
+        "start": int(hops[0]["start"]),
+        "end": None,
         "state": dict(states[0]),
         "ids": [0],
     }
 
     for i in range(1, len(hops)):
+
         same = (
             states[i]["root"] == cur["state"]["root"]
-            and states[i]["type"] == cur["state"]["type"]
+            and
+            states[i]["type"] == cur["state"]["type"]
         )
 
         if same:
-            cur["end"] = hops[i]["end"]
             cur["ids"].append(i)
-        else:
-            regions.append(cur)
-            cur = {
-                "start": hops[i]["start"],
-                "end": hops[i]["end"],
-                "state": dict(states[i]),
-                "ids": [i],
-            }
+            continue
 
+        # The new state's hop START is the exact boundary.
+        boundary = int(hops[i]["start"])
+
+        cur["end"] = boundary
+        regions.append(cur)
+
+        cur = {
+            "start": boundary,
+            "end": None,
+            "state": dict(states[i]),
+            "ids": [i],
+        }
+
+    # Last state runs to the end of generated material.
+    cur["end"] = int(generation_length)
     regions.append(cur)
 
-    # Suppress very short chord regions by attaching them to the neighboring
-    # harmonic state whose pitch-class evidence is most similar.
+    # ---------------------------------------------------------------
+    # Remove zero/negative regions defensively.
+    # ---------------------------------------------------------------
+
+    regions = [
+        r for r in regions
+        if r["end"] > r["start"]
+    ]
+
+    # ---------------------------------------------------------------
+    # Suppress short regions.
+    #
+    # IMPORTANT:
+    # Merging must move ONE SHARED BOUNDARY.
+    # Never use min(start)/max(end) on both sides because that recreates
+    # overlapping regions.
+    # ---------------------------------------------------------------
+
     changed = True
+
     while changed and len(regions) > 1:
+
         changed = False
 
         for i, r in enumerate(regions):
-            if r["end"] - r["start"] >= MIN_REGION_STEPS:
+
+            length = r["end"] - r["start"]
+
+            if length >= MIN_REGION_STEPS:
                 continue
 
+            # -------------------------------------------------------
+            # Decide whether this short region belongs left or right.
+            # -------------------------------------------------------
+
             if i == 0:
-                target = 1
+                target = i + 1
+
             elif i == len(regions) - 1:
                 target = i - 1
+
             else:
                 rv = region_vector(r, hops)
-                ls = cosine(rv, region_vector(regions[i - 1], hops))
-                rs = cosine(rv, region_vector(regions[i + 1], hops))
-                target = i - 1 if ls >= rs else i + 1
 
-            t = regions[target]
-            t["start"] = min(t["start"], r["start"])
-            t["end"] = max(t["end"], r["end"])
-            t["ids"].extend(r["ids"])
+                left_similarity = cosine(
+                    rv,
+                    region_vector(regions[i - 1], hops),
+                )
+
+                right_similarity = cosine(
+                    rv,
+                    region_vector(regions[i + 1], hops),
+                )
+
+                target = (
+                    i - 1
+                    if left_similarity >= right_similarity
+                    else i + 1
+                )
+
+            # -------------------------------------------------------
+            # Absorb the short region WITHOUT overlap.
+            # -------------------------------------------------------
+
+            if target < i:
+                # Absorb into left neighbor.
+                regions[target]["end"] = r["end"]
+                regions[target]["ids"].extend(r["ids"])
+
+            else:
+                # Absorb into right neighbor.
+                regions[target]["start"] = r["start"]
+                regions[target]["ids"].extend(r["ids"])
+
             regions.pop(i)
+
             changed = True
             break
 
-    for r in regions:
-        r["start"] = max(0, int(r["start"]))
-        r["end"] = min(generation_length, int(r["end"]))
+    # ---------------------------------------------------------------
+    # Final normalization.
+    # ---------------------------------------------------------------
+
+    for i, r in enumerate(regions):
+
+        r["start"] = max(
+            0,
+            int(r["start"]),
+        )
+
+        r["end"] = min(
+            int(generation_length),
+            int(r["end"]),
+        )
+
+        r["ids"] = sorted(set(r["ids"]))
+
+        # Force perfect continuity with the next region.
+        if i > 0:
+            r["start"] = regions[i - 1]["end"]
+
+    if regions:
+        regions[0]["start"] = 0
+        regions[-1]["end"] = int(generation_length)
+
+    # ---------------------------------------------------------------
+    # Sanity check: overlap is a programming error.
+    # ---------------------------------------------------------------
+
+    for i in range(1, len(regions)):
+
+        if regions[i]["start"] != regions[i - 1]["end"]:
+            raise RuntimeError(
+                "Non-contiguous harmonic regions: "
+                f"{regions[i - 1]['start']}:"
+                f"{regions[i - 1]['end']} followed by "
+                f"{regions[i]['start']}:"
+                f"{regions[i]['end']}"
+            )
 
     return regions
-
 
 # ---------------------------------------------------------------------------
 # Simple sustained voicing
@@ -666,8 +1048,13 @@ def reconstruct_accompaniment(regions, generation_length, bpm, prompt_steps):
     """
     One sustained voicing per harmonic region.
 
-    `regions` are in generated-local step coordinates.  The returned notes are
+    `regions` are in generated-local step coordinates. The returned notes are
     shifted past the artificial prompt.
+
+    IMPORTANT:
+    Notes are NOT merged across harmonic-region boundaries.
+    Every new chord retriggers all of its pitches, including pitches shared
+    with the previous chord.
     """
     sixth = 60.0 / bpm / 4.0
     notes = []
@@ -697,64 +1084,258 @@ def reconstruct_accompaniment(regions, generation_length, bpm, prompt_steps):
                 )
             )
 
-    # Merge touching/overlapping identical pitches across region boundaries.
-    by_pitch = {}
-    for n in notes:
-        by_pitch.setdefault(n.pitch, []).append(n)
-
-    merged = []
-    for pitch, seq in by_pitch.items():
-        seq.sort(key=lambda n: (n.start, n.end))
-        cur = None
-        for n in seq:
-            if cur is None:
-                cur = n
-            elif n.start <= cur.end + 1e-9:
-                cur.end = max(cur.end, n.end)
-            else:
-                merged.append(cur)
-                cur = n
-        if cur is not None:
-            merged.append(cur)
-
-    return sorted(merged, key=lambda n: (n.start, n.pitch, n.end))
-
+    return sorted(
+        notes,
+        key=lambda n: (
+            n.start,
+            n.pitch,
+            n.end,
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def write_final_midi(input_path, output_path, melody, accompaniment, tempo):
-    source = pretty_midi.PrettyMIDI(input_path)
+def write_final_midi(
+    input_path,
+    output_path,
+    melody,
+    accompaniment,
+    tempo,
+):
+    """
+    Write final Type-1 MIDI.
 
-    result = pretty_midi.PrettyMIDI(
-        resolution=source.resolution,
-        initial_tempo=tempo,
-    )
-    result.time_signature_changes = copy.deepcopy(source.time_signature_changes)
-    result.key_signature_changes = copy.deepcopy(source.key_signature_changes)
+    Track 0:
+        original melody at exact original ticks
+        Program 64
+        tempo / time-signature / key-signature metadata
 
-    accompaniment_track = pretty_midi.Instrument(
-        program=CHORD_PROGRAM,
-        is_drum=False,
-        name="Harmonic Skeleton",
+    Track 1:
+        reconstructed harmonic skeleton
+        Program 0
+
+    Melody timing never passes through seconds.
+    """
+
+    source = mido.MidiFile(input_path)
+    ticks_per_beat = source.ticks_per_beat
+
+    result = mido.MidiFile(
+        type=1,
+        ticks_per_beat=ticks_per_beat,
     )
-    accompaniment_track.notes = [
-        pretty_midi.Note(
-            OUTPUT_VELOCITY,
-            int(n.pitch),
-            float(n.start),
-            float(n.end),
+
+    melody_track = mido.MidiTrack()
+    accompaniment_track = mido.MidiTrack()
+
+    result.tracks.append(melody_track)
+    result.tracks.append(accompaniment_track)
+
+    # ===============================================================
+    # TRACK 0
+    # ===============================================================
+
+    events = []
+
+    # Always write the resolved tempo.
+    events.append(
+        (
+            0,
+            0,
+            mido.MetaMessage(
+                "set_tempo",
+                tempo=mido.bpm2tempo(float(tempo)),
+                time=0,
+            ),
         )
-        for n in accompaniment
-    ]
+    )
 
-    result.instruments.append(melody)
-    result.instruments.append(accompaniment_track)
+    # Preserve time/key signature maps from original MIDI.
+    for track in source.tracks:
+        absolute_tick = 0
 
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    result.write(output_path)
+        for msg in track:
+            absolute_tick += msg.time
 
+            if msg.type in (
+                "time_signature",
+                "key_signature",
+            ):
+                events.append(
+                    (
+                        absolute_tick,
+                        0,
+                        msg.copy(time=0),
+                    )
+                )
+
+    # Force Program 64.
+    events.append(
+        (
+            0,
+            1,
+            mido.Message(
+                "program_change",
+                program=MELODY_PROGRAM,
+                channel=0,
+                time=0,
+            ),
+        )
+    )
+
+    # Original melody events already contain exact source ticks.
+    for absolute_tick, event_type, pitch in melody:
+
+        if event_type == "note_on":
+            msg = mido.Message(
+                "note_on",
+                note=pitch,
+                velocity=OUTPUT_VELOCITY,
+                channel=0,
+                time=0,
+            )
+            order = 2
+
+        else:
+            msg = mido.Message(
+                "note_off",
+                note=pitch,
+                velocity=0,
+                channel=0,
+                time=0,
+            )
+            order = 1
+
+        events.append(
+            (
+                absolute_tick,
+                order,
+                msg,
+            )
+        )
+
+    events.sort(
+        key=lambda x: (
+            x[0],
+            x[1],
+        )
+    )
+
+    previous_tick = 0
+
+    for absolute_tick, _, msg in events:
+        melody_track.append(
+            msg.copy(
+                time=absolute_tick - previous_tick
+            )
+        )
+        previous_tick = absolute_tick
+
+    melody_track.append(
+        mido.MetaMessage(
+            "end_of_track",
+            time=0,
+        )
+    )
+
+    # ===============================================================
+    # TRACK 1
+    # ===============================================================
+
+    accompaniment_track.append(
+        mido.Message(
+            "program_change",
+            program=CHORD_PROGRAM,
+            channel=1,
+            time=0,
+        )
+    )
+
+    accompaniment_events = []
+
+    seconds_per_quarter = 60.0 / float(tempo)
+
+    for note in accompaniment:
+
+        start_tick = int(
+            round(
+                float(note.start)
+                / seconds_per_quarter
+                * ticks_per_beat
+            )
+        )
+
+        end_tick = int(
+            round(
+                float(note.end)
+                / seconds_per_quarter
+                * ticks_per_beat
+            )
+        )
+
+        if end_tick <= start_tick:
+            end_tick = start_tick + 1
+
+        accompaniment_events.append(
+            (
+                start_tick,
+                1,
+                mido.Message(
+                    "note_on",
+                    note=int(note.pitch),
+                    velocity=OUTPUT_VELOCITY,
+                    channel=1,
+                    time=0,
+                ),
+            )
+        )
+
+        accompaniment_events.append(
+            (
+                end_tick,
+                0,
+                mido.Message(
+                    "note_off",
+                    note=int(note.pitch),
+                    velocity=0,
+                    channel=1,
+                    time=0,
+                ),
+            )
+        )
+
+    accompaniment_events.sort(
+        key=lambda x: (
+            x[0],
+            x[1],
+        )
+    )
+
+    previous_tick = 0
+
+    for absolute_tick, _, msg in accompaniment_events:
+        accompaniment_track.append(
+            msg.copy(
+                time=absolute_tick - previous_tick
+            )
+        )
+        previous_tick = absolute_tick
+
+    accompaniment_track.append(
+        mido.MetaMessage(
+            "end_of_track",
+            time=0,
+        )
+    )
+
+    os.makedirs(
+        os.path.dirname(output_path) or ".",
+        exist_ok=True,
+    )
+
+    result.save(output_path)
 
 # ---------------------------------------------------------------------------
 # Generation
@@ -977,7 +1558,7 @@ def generate(
         )
 
         write_final_midi(
-            input_midi,
+            original_input_midi,
             output_path,
             copy.deepcopy(original_melody),
             accompaniment,
