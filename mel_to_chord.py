@@ -1995,6 +1995,7 @@ def refine_boundaries(
     chord_states,
     emissions,
     melody_structure,
+    key_map
 ):
     """
     Fix the 'slow steering wheel' problem.
@@ -2045,6 +2046,23 @@ def refine_boundaries(
             1,
             i - BOUNDARY_BACKTRACK_HOPS,
         )
+
+        # Never backtrack a harmonic boundary across an explicit
+        # MIDI key-signature change.  The key map is authoritative
+        # structural information.
+        if key_map["has_explicit_map"]:
+            current_step = hops[i]["start"]
+
+            for change_step, _ in key_map["changes"]:
+                if (
+                    change_step <= current_step
+                    and change_step > hops[earliest]["start"]
+                ):
+                    while (
+                        earliest < i
+                        and hops[earliest]["start"] < change_step
+                    ):
+                        earliest += 1
 
         chosen = i
 
@@ -2817,6 +2835,7 @@ def generate(
             chord_states,
             emissions,
             melody_structure,
+            key_map,
         )
 
         regions = merge_regions(
