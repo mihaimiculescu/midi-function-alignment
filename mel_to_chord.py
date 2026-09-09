@@ -53,26 +53,6 @@ CHORD_OCTAVE = 3
 
 MODEL_MAX_LENGTH = 384
 
-# SKELETON_WINDOW = 32       # two bars in 4/4
-# SKELETON_HOP = 8            # analyse every half bar
-# MIN_STATE_HOPS = 2          # hysteresis
-# MIN_REGION_STEPS = 16       # do not output 1/2-bar chord blips
-
-#TESTING
-SKELETON_WINDOW = 16
-SKELETON_HOP = 4
-# MIN_STATE_HOPS = 2 # NO LONGER NECESSARY
-# MIN_REGION_STEPS = 8 # NO LONGER NECESSARY
-
-
-# ROOT_CHANGE_PENALTY = 0.02  # NO LONGER NECESSARY
-# ROOT_CHANGE_PENALTY = 0.001 # NO LONGER NECESSARY
-# TYPE_CHANGE_PENALTY = 0.035 # NO LONGER NECESSARY
-TYPE_CHANGE_PENALTY = 0.07
-
-# New chord candidate/challenger must genuinely win, but not by an enormous amount
-# STATE_CHANGE_MARGIN = 0.02
-
 LOWEST_OUTPUT_PITCH = 36    # C2
 HIGHEST_OUTPUT_PITCH = 67    # G4
 MAX_VOICING_NOTES = 4
@@ -80,6 +60,8 @@ MAX_VOICING_NOTES = 4
 # ---------------------------------------------------------------------------
 # Harmonic decoder
 # ---------------------------------------------------------------------------
+
+TYPE_CHANGE_PENALTY = 0.07
 
 # Short horizon: actual chord identity / agility.
 CHORD_WINDOW = 16
@@ -705,390 +687,6 @@ def decode_accompaniment_notes(outputs, ratio, tempo):
                 )
     return notes
 
-
-# ---------------------------------------------------------------------------
-# Pitch-class skeleton - RETIRED
-# ---------------------------------------------------------------------------
-
-# def build_pitch_class_hops(notes, generation_length, bpm):
-#     """
-#     One record every 8 steps, looking at a 32-step window.
-
-#     Each pitch class receives sqrt(overlap_duration) evidence.  This makes
-#     sustained notes stronger than attacks, without allowing a 16-step note
-#     to count 16 times as much as a one-step note.
-
-#     No global key is consulted.
-#     """
-#     sixth = 60.0 / bpm / 4.0
-#     intervals = []
-
-#     for n in notes:
-#         a = n.start / sixth
-#         b = n.end / sixth
-#         if b > a:
-#             intervals.append((a, b, int(n.pitch) % 12))
-
-#     hops = []
-
-#     for start in range(0, generation_length, SKELETON_HOP):
-#         end = min(start + SKELETON_WINDOW, generation_length)
-#         if end <= start:
-#             break
-
-#         weights = np.zeros(12, dtype=np.float64)
-#         occupancy = np.zeros(12, dtype=np.float64)
-
-#         for a, b, pc in intervals:
-#             ov = max(0.0, min(b, end) - max(a, start))
-#             if ov <= 0:
-#                 continue
-#             weights[pc] += math.sqrt(max(ov, 1.0))
-#             occupancy[pc] += ov
-
-#         total = weights.sum()
-#         weights = weights / total if total else weights
-
-#         occ = occupancy / float(end - start)
-#         persistent = [pc for pc in range(12) if occ[pc] >= 0.20]
-#         strong = [pc for pc in range(12) if weights[pc] >= 0.075]
-
-#         hops.append({
-#             "start": start,
-#             "end": end,
-#             "weights": weights,
-#             "occupancy": occ,
-#             "persistent": persistent,
-#             "strong": strong,
-#         })
-
-#     return hops
-
-
-# def chord_label(root, typ):
-#     return f"{PC_NAMES[root]}:{typ}"
-
-
-# def chord_score(weights, root, typ):
-#     intervals = dict(CHORD_TEMPLATES)[typ]
-#     chord_pcs = {(root + x) % 12 for x in intervals}
-
-#     support = sum(weights[p] for p in chord_pcs)
-#     outside = sum(weights[p] for p in range(12) if p not in chord_pcs)
-
-#     third_interval = 3 if ("min" in typ or "dim" in typ) else 4
-#     root_support = weights[root]
-#     third_support = weights[(root + third_interval) % 12]
-#     fifth_support = weights[(root + 7) % 12]
-
-#     score = (
-#         0.72 * support
-#         + 0.22 * root_support
-#         + 0.08 * third_support
-#         + 0.05 * fifth_support
-#         - 0.26 * outside
-#     )
-
-#     if len(intervals) == 4:
-#         seventh = (root + intervals[-1]) % 12
-#         score += 0.10 * weights[seventh]
-#     else:
-#         score += 0.025 * max(
-#             weights[(root + 9) % 12],
-#             weights[(root + 10) % 12],
-#             weights[(root + 11) % 12],
-#         )
-
-#     if typ in ("aug", "dim", "dim7", "half_dim7"):
-#         score -= 0.035
-
-#     return float(score)
-
-
-# def rank_chords(hop, k=10):
-#     result = []
-#     for typ, _ in CHORD_TEMPLATES:
-#         for root in range(12):
-#             result.append({
-#                 "root": root,
-#                 "type": typ,
-#                 "label": chord_label(root, typ),
-#                 "score": chord_score(hop["weights"], root, typ),
-#             })
-#     result.sort(key=lambda x: (-x["score"], x["root"], x["type"]))
-#     return result[:k]
-
-
-# def select_harmonic_states(hops):
-#     """
-#     Per-hop chord labels are NOT trusted directly.
-
-#     A candidate must beat the current chord and remain competitive for two
-#     consecutive hops before a change is committed.  This removes the
-#     8-step label flicker seen in the diagnostic while retaining local changes.
-#     """
-#     if not hops:
-#         return []
-
-#     states = []
-#     current = None
-#     pending_key = None
-#     pending_count = 0
-
-#     for hop in hops:
-#         candidates = rank_chords(hop)
-
-#         scored = []
-#         for c in candidates:
-#             s = c["score"]
-#             if current is not None:
-#                 if c["root"] != current["root"]:
-#                     s -= ROOT_CHANGE_PENALTY
-#                 if c["type"] != current["type"]:
-#                     s -= TYPE_CHANGE_PENALTY
-#             scored.append((s, c))
-
-#         scored.sort(key=lambda x: (-x[0], x[1]["root"], x[1]["type"]))
-#         best_score, best = scored[0]
-
-#         if current is None:
-#             current = dict(best)
-#             states.append(dict(current))
-#             continue
-
-#         stay = chord_score(hop["weights"], current["root"], current["type"])
-
-#         if best["root"] == current["root"] and best["type"] == current["type"]:
-#             pending_key = None
-#             pending_count = 0
-#             states.append(dict(current))
-#             continue
-
-#         # Hysteresis: a new label must have a meaningful local advantage.
-#         if best["score"] - stay < STATE_CHANGE_MARGIN:
-#             states.append(dict(current))
-#             continue
-
-#         key = (best["root"], best["type"])
-#         if key == pending_key:
-#             pending_count += 1
-#         else:
-#             pending_key = key
-#             pending_count = 1
-
-#         if pending_count >= MIN_STATE_HOPS:
-#             current = dict(best)
-#             pending_key = None
-#             pending_count = 0
-
-#         states.append(dict(current))
-
-#     return states
-
-
-# def cosine(a, b):
-#     na = np.linalg.norm(a)
-#     nb = np.linalg.norm(b)
-#     if na == 0 or nb == 0:
-#         return 0.0
-#     return float(np.dot(a, b) / (na * nb))
-
-
-# def region_vector(region, hops):
-#     ids = region["ids"]
-#     if not ids:
-#         return np.zeros(12)
-#     return np.mean([hops[i]["weights"] for i in ids], axis=0)
-
-
-# def merge_regions(hops, states, generation_length):
-#     """
-#     Convert per-hop harmonic states into contiguous, NON-OVERLAPPING
-#     harmonic regions.
-
-#     Important:
-#     A hop's `end` is the end of its ANALYSIS WINDOW.  It is NOT the
-#     end of the harmonic state.
-
-#     Therefore region boundaries are defined by hop START positions.
-#     """
-
-#     if not hops:
-#         return []
-
-#     if len(hops) != len(states):
-#         raise ValueError(
-#             "hops/states length mismatch: "
-#             f"{len(hops)} != {len(states)}"
-#         )
-
-#     # ---------------------------------------------------------------
-#     # First create contiguous runs of identical harmonic states.
-#     # ---------------------------------------------------------------
-
-#     regions = []
-
-#     cur = {
-#         "start": int(hops[0]["start"]),
-#         "end": None,
-#         "state": dict(states[0]),
-#         "ids": [0],
-#     }
-
-#     for i in range(1, len(hops)):
-
-#         same = (
-#             states[i]["root"] == cur["state"]["root"]
-#             and
-#             states[i]["type"] == cur["state"]["type"]
-#         )
-
-#         if same:
-#             cur["ids"].append(i)
-#             continue
-
-#         # The new state's hop START is the exact boundary.
-#         boundary = int(hops[i]["start"])
-
-#         cur["end"] = boundary
-#         regions.append(cur)
-
-#         cur = {
-#             "start": boundary,
-#             "end": None,
-#             "state": dict(states[i]),
-#             "ids": [i],
-#         }
-
-#     # Last state runs to the end of generated material.
-#     cur["end"] = int(generation_length)
-#     regions.append(cur)
-
-#     # ---------------------------------------------------------------
-#     # Remove zero/negative regions defensively.
-#     # ---------------------------------------------------------------
-
-#     regions = [
-#         r for r in regions
-#         if r["end"] > r["start"]
-#     ]
-
-#     # ---------------------------------------------------------------
-#     # Suppress short regions.
-#     #
-#     # IMPORTANT:
-#     # Merging must move ONE SHARED BOUNDARY.
-#     # Never use min(start)/max(end) on both sides because that recreates
-#     # overlapping regions.
-#     # ---------------------------------------------------------------
-
-#     changed = True
-
-#     while changed and len(regions) > 1:
-
-#         changed = False
-
-#         for i, r in enumerate(regions):
-
-#             length = r["end"] - r["start"]
-
-#             if length >= MIN_REGION_STEPS:
-#                 continue
-
-#             # -------------------------------------------------------
-#             # Decide whether this short region belongs left or right.
-#             # -------------------------------------------------------
-
-#             if i == 0:
-#                 target = i + 1
-
-#             elif i == len(regions) - 1:
-#                 target = i - 1
-
-#             else:
-#                 rv = region_vector(r, hops)
-
-#                 left_similarity = cosine(
-#                     rv,
-#                     region_vector(regions[i - 1], hops),
-#                 )
-
-#                 right_similarity = cosine(
-#                     rv,
-#                     region_vector(regions[i + 1], hops),
-#                 )
-
-#                 target = (
-#                     i - 1
-#                     if left_similarity >= right_similarity
-#                     else i + 1
-#                 )
-
-#             # -------------------------------------------------------
-#             # Absorb the short region WITHOUT overlap.
-#             # -------------------------------------------------------
-
-#             if target < i:
-#                 # Absorb into left neighbor.
-#                 regions[target]["end"] = r["end"]
-#                 regions[target]["ids"].extend(r["ids"])
-
-#             else:
-#                 # Absorb into right neighbor.
-#                 regions[target]["start"] = r["start"]
-#                 regions[target]["ids"].extend(r["ids"])
-
-#             regions.pop(i)
-
-#             changed = True
-#             break
-
-#     # ---------------------------------------------------------------
-#     # Final normalization.
-#     # ---------------------------------------------------------------
-
-#     for i, r in enumerate(regions):
-
-#         r["start"] = max(
-#             0,
-#             int(r["start"]),
-#         )
-
-#         r["end"] = min(
-#             int(generation_length),
-#             int(r["end"]),
-#         )
-
-#         r["ids"] = sorted(set(r["ids"]))
-
-#         # Force perfect continuity with the next region.
-#         if i > 0:
-#             r["start"] = regions[i - 1]["end"]
-
-#     if regions:
-#         regions[0]["start"] = 0
-#         regions[-1]["end"] = int(generation_length)
-
-#     # ---------------------------------------------------------------
-#     # Sanity check: overlap is a programming error.
-#     # ---------------------------------------------------------------
-
-#     for i in range(1, len(regions)):
-
-#         if regions[i]["start"] != regions[i - 1]["end"]:
-#             raise RuntimeError(
-#                 "Non-contiguous harmonic regions: "
-#                 f"{regions[i - 1]['start']}:"
-#                 f"{regions[i - 1]['end']} followed by "
-#                 f"{regions[i]['start']}:"
-#                 f"{regions[i]['end']}"
-#             )
-
-#     return regions
-
-# ---------------------------------------------------------------------------
-# END OF Pitch-class skeleton - RETIRED
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Simple sustained voicing
@@ -2166,6 +1764,302 @@ def refine_boundaries(
 
     return refined
 
+def print_boundary_diagnostics(
+    hops,
+    states,
+    chord_states,
+    emissions,
+    melody_structure,
+):
+    """
+    Diagnostic only.
+
+    For every harmonic-family transition in the final refined state path,
+    print the surrounding evidence at:
+
+        -2 hops
+        -1 hop
+         boundary
+        +1 hop
+        +2 hops
+
+    For each surrounding hop we show the emission score for:
+
+        OLD = family before the boundary
+        NEW = family after the boundary
+
+    This tells us whether the new harmony was already competitive before
+    the selected boundary, or whether the underlying evidence itself
+    arrived late.
+
+    This function changes absolutely nothing in decoding.
+    """
+
+    if not states:
+        return
+
+    print("\n  === HARMONIC BOUNDARY DIAGNOSTICS ===")
+
+    boundary_count = 0
+
+    for i in range(1, len(states)):
+        old_state = states[i - 1]
+        new_state = states[i]
+
+        old_identity = (
+            old_state["root"],
+            old_state["type"],
+        )
+        new_identity = (
+            new_state["root"],
+            new_state["type"],
+        )
+
+        if old_identity == new_identity:
+            continue
+
+        boundary_count += 1
+
+        boundary_step = hops[i]["start"]
+
+        features = melody_boundary_features(
+            melody_structure,
+            boundary_step,
+        )
+
+        print()
+        print(
+            f"  BOUNDARY {boundary_count:02d} "
+            f"@ step {boundary_step}: "
+            f"{old_state['label']} -> {new_state['label']}"
+        )
+
+        print(
+            "    melody: "
+            f"onset_here={features['onset_here']}  "
+            f"sounding={features['sounding']}  "
+            f"inside_rest={features['inside_rest']}  "
+            f"return_after_long_rest="
+            f"{features['return_after_long_rest']}"
+        )
+
+        old_idx = None
+        new_idx = None
+
+        for s_idx, candidate in enumerate(chord_states):
+            identity = (
+                candidate["root"],
+                candidate["type"],
+            )
+
+            if identity == old_identity:
+                old_idx = s_idx
+
+            if identity == new_identity:
+                new_idx = s_idx
+
+        if old_idx is None or new_idx is None:
+            print(
+                "    WARNING: could not locate decoder states "
+                "for diagnostic."
+            )
+            continue
+
+        print(
+            "    relative   step     old       new       "
+            "new-old    melody"
+        )
+
+        for offset in range(-2, 3):
+            j = i + offset
+
+            if j < 0 or j >= len(hops):
+                continue
+
+            step = hops[j]["start"]
+
+            old_score = float(
+                emissions[j, old_idx]
+            )
+            new_score = float(
+                emissions[j, new_idx]
+            )
+
+            delta = new_score - old_score
+
+            local_features = melody_boundary_features(
+                melody_structure,
+                step,
+            )
+
+            melody_flags = []
+
+            if local_features["onset_here"]:
+                melody_flags.append("ONSET")
+
+            if local_features["inside_rest"]:
+                melody_flags.append("REST")
+
+            if local_features["return_after_long_rest"]:
+                melody_flags.append("RETURN")
+
+            if local_features["sounding"]:
+                melody_flags.append("SOUND")
+
+            flag_text = (
+                ",".join(melody_flags)
+                if melody_flags
+                else "-"
+            )
+
+            marker = (
+                " <BOUNDARY"
+                if offset == 0
+                else ""
+            )
+
+            print(
+                f"    {offset:+3d}      "
+                f"{step:4d}   "
+                f"{old_score:8.3f}  "
+                f"{new_score:8.3f}  "
+                f"{delta:+8.3f}   "
+                f"{flag_text}"
+                f"{marker}"
+            )
+
+    if boundary_count == 0:
+        print("    No harmonic-family transitions.")
+
+def print_refinement_diagnostics(
+    hops,
+    raw_states,
+    refined_states,
+):
+    """
+    Show exactly which harmonic boundaries were moved by
+    refine_boundaries(), and by how many sixteenth-note steps.
+    """
+
+    def get_boundaries(states):
+        result = []
+
+        for i in range(1, len(states)):
+            old = states[i - 1]
+            new = states[i]
+
+            if (
+                old["root"] != new["root"]
+                or old["type"] != new["type"]
+            ):
+                result.append({
+                    "index": i,
+                    "step": hops[i]["start"],
+                    "old": (
+                        old["root"],
+                        old["type"],
+                        old["label"],
+                    ),
+                    "new": (
+                        new["root"],
+                        new["type"],
+                        new["label"],
+                    ),
+                })
+
+        return result
+
+    raw = get_boundaries(raw_states)
+    refined = get_boundaries(refined_states)
+
+    print("\n  === BOUNDARY REFINEMENT DIAGNOSTICS ===")
+
+    if raw == refined:
+        print("    No boundaries moved.")
+        return
+
+    raw_by_transition = {}
+
+    for boundary in raw:
+        key = (
+            boundary["old"][0],
+            boundary["old"][1],
+            boundary["new"][0],
+            boundary["new"][1],
+        )
+
+        raw_by_transition.setdefault(
+            key,
+            [],
+        ).append(boundary)
+
+    used = set()
+
+    for refined_boundary in refined:
+        key = (
+            refined_boundary["old"][0],
+            refined_boundary["old"][1],
+            refined_boundary["new"][0],
+            refined_boundary["new"][1],
+        )
+
+        candidates = raw_by_transition.get(
+            key,
+            [],
+        )
+
+        best = None
+        best_distance = None
+
+        for candidate in candidates:
+            candidate_id = id(candidate)
+
+            if candidate_id in used:
+                continue
+
+            distance = abs(
+                candidate["step"]
+                - refined_boundary["step"]
+            )
+
+            if (
+                best is None
+                or distance < best_distance
+            ):
+                best = candidate
+                best_distance = distance
+
+        if best is None:
+            print(
+                f"    NEW/CHANGED transition at "
+                f"{refined_boundary['step']:4d}: "
+                f"{refined_boundary['old'][2]} -> "
+                f"{refined_boundary['new'][2]}"
+            )
+            continue
+
+        used.add(id(best))
+
+        delta = (
+            refined_boundary["step"]
+            - best["step"]
+        )
+
+        if delta == 0:
+            status = "unchanged"
+        elif delta < 0:
+            status = f"moved EARLIER by {-delta} steps"
+        else:
+            status = f"moved LATER by {delta} steps"
+
+        print(
+            f"    "
+            f"{best['old'][2]} -> "
+            f"{best['new'][2]}: "
+            f"raw={best['step']:4d}  "
+            f"refined={refined_boundary['step']:4d}  "
+            f"{status}"
+        )
 
 # ---------------------------------------------------------------------------
 # Contiguous regions
@@ -2728,9 +2622,6 @@ def generate(
     print(f"Temperature:        {temperature}")
     print(f"Samples:            {samples}")
     print(f"Seed:               {seed}")
-    # print(f"Skeleton window:    {SKELETON_WINDOW} steps")
-    # print(f"Skeleton hop:       {SKELETON_HOP} steps")
-    # print(f"Minimum region:     {MIN_REGION_STEPS} steps")
     print(f"Chord window:       {CHORD_WINDOW} steps")
     print(f"Key context:        {KEY_CONTEXT_WINDOW} steps")
     print(f"Skeleton hop:       {SKELETON_HOP} steps")
@@ -2942,16 +2833,6 @@ def generate(
         print(f"PROPOSAL {sample_index}/{samples}")
         print(f"  Raw CP notes after prompt: {len(local_notes)}")
 
-        # hops = build_pitch_class_hops(
-        #     local_notes,
-        #     local_length,
-        #     bpm,
-        # )
-        # print(f"  8-step harmonic hops:      {len(hops)}")
-
-        # states = select_harmonic_states(hops)
-        # regions = merge_regions(hops, states, local_length)
-
         hops = build_pitch_class_hops(
             local_notes,
             local_length,
@@ -2980,6 +2861,8 @@ def generate(
             melody_structure,
         )
 
+        raw_viterbi_states = copy.deepcopy(states)
+
         states = refine_boundaries(
             hops,
             states,
@@ -2987,6 +2870,20 @@ def generate(
             emissions,
             melody_structure,
             key_map,
+        )
+
+        print_refinement_diagnostics(
+            hops,
+            raw_viterbi_states,
+            states,
+        )
+
+        print_boundary_diagnostics(
+            hops,
+            states,
+            chord_states,
+            emissions,
+            melody_structure,
         )
 
         family_regions = merge_regions(
