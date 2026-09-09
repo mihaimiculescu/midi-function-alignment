@@ -41,6 +41,7 @@ DEFAULT_DENOMINATOR = 4
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_SAMPLES = 1
 DEFAULT_SEED = 0
+DEFAULT_CONDITIONING_MULTIPLIER = 1.0
 
 # Kept for command-line compatibility.  It is intentionally NOT used to
 # retain generated attacks anymore.
@@ -3890,6 +3891,7 @@ def generate(
     seed,
     vicinity_fraction,
     prompt_key,
+    conditioning_multiplier,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -3902,6 +3904,7 @@ def generate(
     print(f"Temperature:        {temperature}")
     print(f"Samples:            {samples}")
     print(f"Seed:               {seed}")
+    print(f"Conditioning mult.: {conditioning_multiplier}")
     print(f"Chord window:       {CHORD_WINDOW} steps")
     print(f"Key context:        {KEY_CONTEXT_WINDOW} steps")
     print(f"Skeleton hop:       {SKELETON_HOP} steps")
@@ -4022,6 +4025,7 @@ def generate(
                     melody_chunk.repeat(samples, 1, 1),
                     x2.repeat(samples, 1, 1),
                     temperature=temperature,
+                    multiplier=float(conditioning_multiplier),
                 )
 
             for i in range(samples):
@@ -4051,6 +4055,7 @@ def generate(
                     melody_chunk.repeat(samples, 1, 1),
                     prompt_batch,
                     temperature=temperature,
+                    multiplier=float(conditioning_multiplier),
                 )
 
             for i in range(samples):
@@ -4287,6 +4292,16 @@ def main():
         help="16th-note steps; defaults to input MIDI length.",
     )
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument(
+        "--conditioning-multiplier",
+        type=float,
+        default=DEFAULT_CONDITIONING_MULTIPLIER,
+        help=(
+            "YinYang melody-conditioning strength. "
+            "1.0 = normal conditioning; "
+            "0.0 = disable melody cross-attention contribution."
+        ),
+    )
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
 
@@ -4364,6 +4379,32 @@ def main():
     model.cuda()
     model.eval()
 
+    print()
+    print("=== YINYANG CONDITIONING GATES ===")
+
+    gate_values = []
+
+    for i, attn in enumerate(model.yinyang_attn):
+        gate = float(attn.gates.detach().float().cpu().item())
+        gate_values.append(gate)
+
+        print(
+            f"adapter {i:02d}: "
+            f"gate={gate:+.8f}"
+        )
+
+    if gate_values:
+        gate_abs = [abs(x) for x in gate_values]
+
+        print(
+            f"gate summary: "
+            f"count={len(gate_values)}  "
+            f"min={min(gate_values):+.8f}  "
+            f"max={max(gate_values):+.8f}  "
+            f"mean={np.mean(gate_values):+.8f}  "
+            f"mean_abs={np.mean(gate_abs):.8f}"
+        )
+
     generate(
         model=model,
         input_midi=synthetic_input,
@@ -4377,6 +4418,7 @@ def main():
         seed=args.seed,
         vicinity_fraction=args.vicinity,
         prompt_key=args.key,
+        conditioning_multiplier=args.conditioning_multiplier,
     )
 
 
