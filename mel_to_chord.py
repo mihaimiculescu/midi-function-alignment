@@ -93,7 +93,8 @@ LONG_REST_STEPS = 8
 # Boundary repair: after future evidence confirms a new chord, allow the
 # boundary to move backwards by up to two analysis hops.
 BOUNDARY_BACKTRACK_HOPS = 2
-BOUNDARY_BACKTRACK_MARGIN = 0.040
+# BOUNDARY_BACKTRACK_MARGIN = 0.040 # DEFAULT
+BOUNDARY_BACKTRACK_MARGIN = 0.0
 
 # Do not let a practically-zero-confidence inferred key keep exerting
 # transition resistance.
@@ -1474,6 +1475,99 @@ def build_decoder_evidence(
 
     return emissions, key_confidences
 
+def print_truth_landmark_emissions(
+    hops,
+    chord_states,
+    emissions,
+):
+    """
+    Diagnostic only.
+
+    Compare raw family-level emission scores against known harmonic truth
+    landmarks for ReconstruirePredestinati.mid.
+
+    Local generated step 0 = bar 3 beat 1.
+    Therefore:
+        bar 23 -> step 320
+        bar 24 -> step 336
+        ...
+    """
+
+    landmarks = {
+        320: "BAR 23 truth=D#:maj",
+        336: "BAR 24 truth=A#:maj",
+        352: "BAR 25 truth=C:min",
+        368: "BAR 26 truth=G#:maj",
+        384: "BAR 27 truth=D#:maj",
+        400: "BAR 28 truth=A#:maj",
+        416: "BAR 29 truth=C:min",
+        432: "BAR 30 truth=G#:maj",
+        448: "BAR 31 truth=D#:maj",
+    }
+
+    watched_labels = {
+        "C:min",
+        "D#:maj",
+        "A#:maj",
+        "G#:maj",
+        "G:min",
+        "F:min",
+        "D:min",
+    }
+
+    state_indices = {
+        state["label"]: i
+        for i, state in enumerate(chord_states)
+        if state["label"] in watched_labels
+    }
+
+    print()
+    print("  === TRUTH LANDMARK RAW EMISSIONS ===")
+
+    for target_step, description in landmarks.items():
+        hop_index = next(
+            (
+                i
+                for i, hop in enumerate(hops)
+                if hop["start"] == target_step
+            ),
+            None,
+        )
+
+        if hop_index is None:
+            print()
+            print(
+                f"  step {target_step}: {description} "
+                f"[NO EXACT HOP]"
+            )
+            continue
+
+        ranked = []
+
+        for label, state_index in state_indices.items():
+            ranked.append(
+                (
+                    float(emissions[hop_index, state_index]),
+                    label,
+                )
+            )
+
+        ranked.sort(reverse=True)
+
+        print()
+        print(
+            f"  step {target_step}: {description}"
+        )
+
+        for rank, (score, label) in enumerate(
+            ranked,
+            start=1,
+        ):
+            print(
+                f"    {rank:2d}. "
+                f"{label:8s} "
+                f"{score:+.6f}"
+            )
 
 def decode_harmonic_sequence(
     hops,
@@ -2850,6 +2944,12 @@ def generate(
             hops,
             chord_states,
             key_map,
+        )
+
+        print_truth_landmark_emissions(
+            hops,
+            chord_states,
+            emissions,
         )
 
         states = decode_harmonic_sequence(
