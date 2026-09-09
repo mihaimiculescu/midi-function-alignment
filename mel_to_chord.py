@@ -64,7 +64,7 @@ MAX_VOICING_NOTES = 4
 TYPE_CHANGE_PENALTY = 0.07
 
 # Short horizon: actual chord identity / agility.
-CHORD_WINDOW = 16
+CHORD_WINDOW = 8
 SKELETON_HOP = 4
 
 # Long FUTURE horizon: only used to decide how trustworthy the current
@@ -829,7 +829,7 @@ def _weighted_pitch_classes(intervals, start, end):
             min(b, end) - max(a, start),
         )
 
-        if ov <= 0:
+        if ov <= 1e-6:
             continue
 
         weights[pc] += math.sqrt(max(ov, 1.0))
@@ -1567,6 +1567,1192 @@ def print_truth_landmark_emissions(
                 f"    {rank:2d}. "
                 f"{label:8s} "
                 f"{score:+.6f}"
+            )
+
+def print_viterbi_vs_emission_diagnostics(
+    hops,
+    chord_states,
+    emissions,
+    raw_viterbi_states,
+    refined_states,
+):
+    """
+    Compare the independent best emission at each hop with:
+      1. the whole-sequence raw Viterbi path
+      2. the post-refinement path
+
+    Diagnostic only. Does not alter decoding.
+    """
+
+    print()
+    print("  === EMISSION WINNER -> RAW VITERBI -> REFINED ===")
+    print(
+        "  step   emission       score    raw_viterbi   refined       "
+        "VIT?  REF?"
+    )
+    print(
+        "  ----   ------------  -------   ------------  ------------  "
+        "----  ----"
+    )
+
+    # Our current reference area.
+    TRACE_START = 312
+    TRACE_END = 452
+
+    for i, hop in enumerate(hops):
+        step = hop["start"]
+
+        if step < TRACE_START or step > TRACE_END:
+            continue
+
+        emission_idx = int(np.argmax(emissions[i]))
+        emission_state = chord_states[emission_idx]
+        emission_label = emission_state["label"]
+        emission_score = float(emissions[i, emission_idx])
+
+        raw_label = raw_viterbi_states[i]["label"]
+        refined_label = refined_states[i]["label"]
+
+        viterbi_changed = raw_label != emission_label
+        refinement_changed = refined_label != raw_label
+
+        print(
+            f"  {step:4d}   "
+            f"{emission_label:12s}  "
+            f"{emission_score:+.3f}   "
+            f"{raw_label:12s}  "
+            f"{refined_label:12s}  "
+            f"{'YES' if viterbi_changed else '-':4s}  "
+            f"{'YES' if refinement_changed else '-':4s}"
+        )
+
+def print_truth_temporal_emission_trace(
+    hops,
+    chord_states,
+    emissions,
+):
+    """
+    Diagnostic only.
+
+    Trace raw family-level emissions every 4 generated steps around the
+    known Predestinati harmonic-reference boundaries.
+
+    Local generated step 0 = bar 3 beat 1.
+
+    Reference cycle from bar 23 onward:
+
+        bar 23 / step 320   D#:maj   (Eb)
+        bar 24 / step 336   A#:maj   (Bb)
+        bar 25 / step 352   C:min    (Cm)
+        bar 26 / step 368   G#:maj   (Ab)
+        bar 27 / step 384   D#:maj
+        ...
+
+    The trace begins half a bar before bar 23 and continues 12 steps
+    beyond the bar-31 boundary, so that we can inspect the temporal
+    evolution of the raw emission evidence across every truth boundary.
+
+    This function changes absolutely nothing in decoding.
+    """
+
+    truth_cycle = [
+        "D#:maj",
+        "A#:maj",
+        "C:min",
+        "G#:maj",
+    ]
+
+    core_labels = [
+        "C:min",
+        "D#:maj",
+        "A#:maj",
+        "G#:maj",
+    ]
+
+    # We deliberately trace:
+    #
+    #   312, 316,
+    #   320, 324, 328, 332,
+    #   336, 340, ...
+    #   ...
+    #   448, 452, 456, 460
+    #
+    trace_start = 312
+    trace_end = 460
+
+    # Exact hop lookup.
+    hop_index_by_step = {
+        int(hop["start"]): i
+        for i, hop in enumerate(hops)
+    }
+
+    # Exact decoder-state lookup.
+    state_index_by_label = {
+        state["label"]: i
+        for i, state in enumerate(chord_states)
+    }
+
+    missing_core = [
+        label
+        for label in core_labels
+        if label not in state_index_by_label
+    ]
+
+    if missing_core:
+        print()
+        print("  === TRUTH TEMPORAL RAW-EMISSION TRACE ===")
+        print(
+            "  WARNING: missing required harmonic states: "
+            + ", ".join(missing_core)
+        )
+        return
+
+    print()
+    print("  === TRUTH TEMPORAL RAW-EMISSION TRACE ===")
+    print(
+        "  Raw family emissions only; "
+        "before Viterbi / refinement / reconstruction."
+    )
+    print(
+        "  Each hop uses the existing future-looking "
+        f"{CHORD_WINDOW}-step chord window."
+    )
+    print()
+    print(
+        "  step  truth     "
+        "C:min      D#:maj     A#:maj     G#:maj     "
+        "winner    win_score  truth_rank  gap"
+    )
+    print(
+        "  ----  --------  "
+        "---------  ---------  ---------  ---------  "
+        "--------  ---------  ----------  ---------"
+    )
+
+    for step in range(
+        trace_start,
+        trace_end + 1,
+        SKELETON_HOP,
+    ):
+        hop_index = hop_index_by_step.get(step)
+
+        if hop_index is None:
+            print(
+                f"  {step:4d}  "
+                f"{'[NO HOP]':8s}"
+            )
+            continue
+
+        # Bar 23 begins at step 320.
+        #
+        # Python floor division is useful here:
+        #
+        #   step 312 -> (-8 // 16) = -1 -> cycle[-1] = G#:maj
+        #
+        # so the two pre-boundary samples correctly belong to the
+        # preceding Ab-reference bar.
+        truth_bar_offset = (
+            (step - 320) // 16
+        )
+
+        truth_label = truth_cycle[
+            truth_bar_offset % len(truth_cycle)
+        ]
+
+        # Rank ALL harmonic-family states, not merely the four
+        # reference families.
+        ranked_indices = sorted(
+            range(len(chord_states)),
+            key=lambda state_index: float(
+                emissions[
+                    hop_index,
+                    state_index,
+                ]
+            ),
+            reverse=True,
+        )
+
+        winner_index = ranked_indices[0]
+        winner_label = chord_states[
+            winner_index
+        ]["label"]
+        winner_score = float(
+            emissions[
+                hop_index,
+                winner_index,
+            ]
+        )
+
+        truth_index = state_index_by_label[
+            truth_label
+        ]
+        truth_score = float(
+            emissions[
+                hop_index,
+                truth_index,
+            ]
+        )
+
+        truth_rank = (
+            ranked_indices.index(truth_index)
+            + 1
+        )
+
+        gap = winner_score - truth_score
+
+        core_scores = {
+            label: float(
+                emissions[
+                    hop_index,
+                    state_index_by_label[label],
+                ]
+            )
+            for label in core_labels
+        }
+
+        boundary_marker = (
+            " <BOUNDARY"
+            if (
+                step >= 320
+                and (step - 320) % 16 == 0
+            )
+            else ""
+        )
+
+        print(
+            f"  {step:4d}  "
+            f"{truth_label:8s}  "
+            f"{core_scores['C:min']:+9.3f}  "
+            f"{core_scores['D#:maj']:+9.3f}  "
+            f"{core_scores['A#:maj']:+9.3f}  "
+            f"{core_scores['G#:maj']:+9.3f}  "
+            f"{winner_label:8s}  "
+            f"{winner_score:+9.3f}  "
+            f"{truth_rank:10d}  "
+            f"{gap:+9.3f}"
+            f"{boundary_marker}"
+        )
+
+        # If the winner is outside the four reference families,
+        # make that explicitly visible rather than forcing the reader
+        # to infer it from the compact table.
+        if winner_label not in core_labels:
+            print(
+                f"        outside-core winner: "
+                f"{winner_label} "
+                f"{winner_score:+.6f}"
+            )
+
+def print_truth_four_step_harmonic_trace(
+    local_notes,
+    chord_states,
+    bpm,
+):
+    """
+    Diagnostic only.
+
+    Inspect the generated accompaniment in NON-OVERLAPPING 4-step windows:
+
+        [320,324)
+        [324,328)
+        [328,332)
+        ...
+
+    This does NOT alter CHORD_WINDOW.
+
+    It reuses:
+        _weighted_pitch_classes()
+        family_score()
+
+    exactly as the production harmonic analysis does.
+
+    No key prior.
+    No Viterbi.
+    No continuity.
+    No boundary refinement.
+    No reconstruction.
+
+    Purpose:
+        reveal the actual local harmonic content generated by the model
+        at quarter-bar resolution.
+    """
+
+    TRACE_START = 312
+    TRACE_END = 456
+    TRACE_WINDOW = 8
+
+    truth_cycle = [
+        "D#:maj",   # Eb
+        "A#:maj",   # Bb
+        "C:min",    # Cm
+        "G#:maj",   # Ab
+    ]
+
+    state_index_by_label = {
+        state["label"]: i
+        for i, state in enumerate(chord_states)
+    }
+
+    sixteenth = 60.0 / bpm / 4.0
+
+    # --------------------------------------------------------------
+    # Convert generated notes to the SAME step-domain interval form
+    # used by build_pitch_class_hops().
+    # --------------------------------------------------------------
+
+    intervals = []
+
+    detailed_intervals = []
+
+    for note in local_notes:
+
+        start_step = note.start / sixteenth
+        end_step = note.end / sixteenth
+
+        if end_step <= start_step:
+            continue
+
+        pc = int(note.pitch) % 12
+
+        intervals.append(
+            (
+                float(start_step),
+                float(end_step),
+                pc,
+            )
+        )
+
+        detailed_intervals.append({
+            "pitch": int(note.pitch),
+            "pc": pc,
+            "start": float(start_step),
+            "end": float(end_step),
+        })
+
+    print()
+    print("=" * 112)
+    print("4-STEP RAW GENERATED HARMONIC TRACE")
+    print("=" * 112)
+
+    print(
+        "Each row analyzes one independent 4-step window using "
+        "_weighted_pitch_classes() + family_score()."
+    )
+
+    print(
+        "No CHORD_WINDOW change; no key prior; no Viterbi; "
+        "no refinement."
+    )
+
+    print()
+
+    print(
+        " step-window   truth     winner      score     "
+        "truth_score  truth_rank   gap      dominant pitch classes"
+    )
+
+    print(
+        " -----------   --------  ----------  --------  "
+        "-----------  ----------  -------  ----------------------"
+    )
+
+    # --------------------------------------------------------------
+    # Main 4-step trace.
+    # --------------------------------------------------------------
+
+    for start in range(
+        TRACE_START,
+        TRACE_END,
+        TRACE_WINDOW,
+    ):
+
+        end = start + TRACE_WINDOW
+
+        weights, occupancy = _weighted_pitch_classes(
+            intervals,
+            start,
+            end,
+        )
+
+        # ----------------------------------------------------------
+        # Score ALL 48 family states using pure LOCAL evidence.
+        # ----------------------------------------------------------
+
+        scored = []
+
+        for state_index, state in enumerate(chord_states):
+
+            score = family_score(
+                weights,
+                state["root"],
+                state["type"],
+            )
+
+            scored.append(
+                (
+                    float(score),
+                    state_index,
+                )
+            )
+
+        scored.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        winner_score, winner_index = scored[0]
+
+        winner_label = chord_states[
+            winner_index
+        ]["label"]
+
+        # ----------------------------------------------------------
+        # Reference family.
+        #
+        # Only claim reference truth from step 320 onward.
+        # ----------------------------------------------------------
+
+        truth_label = None
+
+        if start >= 320:
+
+            bar_offset = (
+                (start - 320) // 16
+            )
+
+            truth_label = truth_cycle[
+                bar_offset % len(truth_cycle)
+            ]
+
+        if truth_label is not None:
+
+            truth_index = state_index_by_label[
+                truth_label
+            ]
+
+            truth_score = family_score(
+                weights,
+                chord_states[truth_index]["root"],
+                chord_states[truth_index]["type"],
+            )
+
+            ranked_indices = [
+                index
+                for _, index in scored
+            ]
+
+            truth_rank = (
+                ranked_indices.index(truth_index)
+                + 1
+            )
+
+            gap = (
+                winner_score
+                - truth_score
+            )
+
+        else:
+
+            truth_score = None
+            truth_rank = None
+            gap = None
+
+        # ----------------------------------------------------------
+        # Summarize strongest pitch classes.
+        # ----------------------------------------------------------
+
+        pc_order = sorted(
+            range(12),
+            key=lambda pc: float(weights[pc]),
+            reverse=True,
+        )
+
+        pc_summary_parts = []
+
+        for pc in pc_order:
+
+            if weights[pc] <= 0.0:
+                continue
+
+            pc_summary_parts.append(
+                f"{PC_NAMES[pc]}:{weights[pc]:.3f}"
+            )
+
+            if len(pc_summary_parts) >= 5:
+                break
+
+        pc_summary = (
+            " ".join(pc_summary_parts)
+            if pc_summary_parts
+            else "[none]"
+        )
+
+        boundary_marker = (
+            " <BAR"
+            if (
+                start >= 320
+                and (start - 320) % 16 == 0
+            )
+            else ""
+        )
+
+        if truth_label is not None:
+
+            print(
+                f" {start:3d}-{end:<3d}      "
+                f"{truth_label:8s}  "
+                f"{winner_label:10s}  "
+                f"{winner_score:+8.3f}  "
+                f"{truth_score:+11.3f}  "
+                f"{truth_rank:10d}  "
+                f"{gap:+7.3f}  "
+                f"{pc_summary}"
+                f"{boundary_marker}"
+            )
+
+        else:
+
+            print(
+                f" {start:3d}-{end:<3d}      "
+                f"{'-':8s}  "
+                f"{winner_label:10s}  "
+                f"{winner_score:+8.3f}  "
+                f"{'-':>11s}  "
+                f"{'-':>10s}  "
+                f"{'-':>7s}  "
+                f"{pc_summary}"
+            )
+
+    # --------------------------------------------------------------
+    # Focused verbose blocks.
+    #
+    # These are the most useful windows for our current test.
+    # --------------------------------------------------------------
+
+    # focus_steps = [
+    #     320,
+    #     324,
+    #     328,
+    #     332,
+    #     336,
+    #     340,
+    #     344,
+    #     348,
+    #     352,
+    #     356,
+    #     360,
+    #     364,
+    #     368,
+    #     372,
+    #     376,
+    #     380,
+    #     384,
+    #     388,
+    #     392,
+    #     396,
+    #     400,
+    #     404,
+    #     408,
+    #     412,
+    #     416,
+    #     420,
+    #     424,
+    #     428,
+    #     432,
+    #     436,
+    #     440,
+    #     444,
+    #     448,
+    #     452,
+    # ]
+    focus_steps = [
+        320,
+        328,
+        336,
+        344,
+        352,
+        360,
+        368,
+        376,
+        384,
+        392,
+        400,
+        408,
+        416,
+        424,
+        432,
+        440,
+        448,
+    ]
+    print()
+    print("=" * 112)
+    print("4-STEP FOCUSED RAW-NOTE DETAILS")
+    print("=" * 112)
+
+    for start in focus_steps:
+
+        end = start + TRACE_WINDOW
+
+        weights, occupancy = _weighted_pitch_classes(
+            intervals,
+            start,
+            end,
+        )
+
+        overlapping = []
+
+        for item in detailed_intervals:
+
+            overlap = max(
+                0.0,
+                min(item["end"], end)
+                - max(item["start"], start),
+            )
+# #TEMP INSERT
+#             if abs(overlap) < 1e-6:
+#                 print(
+#                     "    DEBUG TINY OVERLAP:"
+#                     f" window=[{start:.17f}, {end:.17f})"
+#                     f" note=[{item['start']:.17f}, {item['end']:.17f})"
+#                     f" raw_diff="
+#                     f"{min(item['end'], end) - max(item['start'], start):.17g}"
+#                     f" overlap={overlap:.17g}"
+#                 )
+# #END TEMP INSERT
+            if overlap <= 0.0:
+                continue
+
+            overlapping.append({
+                **item,
+                "overlap": overlap,
+            })
+
+        overlapping.sort(
+            key=lambda item: (
+                item["start"],
+                item["pitch"],
+                item["end"],
+            )
+        )
+
+        scored = []
+
+        for state_index, state in enumerate(chord_states):
+
+            score = family_score(
+                weights,
+                state["root"],
+                state["type"],
+            )
+
+            scored.append(
+                (
+                    float(score),
+                    state_index,
+                )
+            )
+
+        scored.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        print()
+        print("-" * 112)
+
+        if start >= 320:
+
+            bar_offset = (
+                (start - 320) // 16
+            )
+
+            truth_label = truth_cycle[
+                bar_offset % len(truth_cycle)
+            ]
+
+        else:
+            truth_label = "-"
+
+        print(
+            f"WINDOW [{start}, {end})"
+            f"   truth={truth_label}"
+        )
+
+        print()
+        print("  TOP FAMILY SCORES")
+
+        for rank, (
+            score,
+            state_index,
+        ) in enumerate(
+            scored[:8],
+            start=1,
+        ):
+
+            label = chord_states[
+                state_index
+            ]["label"]
+
+            marker = ""
+
+            if label == truth_label:
+                marker = "  <REFERENCE>"
+
+            print(
+                f"    {rank:2d}. "
+                f"{label:9s} "
+                f"{score:+.6f}"
+                f"{marker}"
+            )
+
+        print()
+        print("  PITCH-CLASS EVIDENCE")
+
+        for pc in range(12):
+
+            if (
+                weights[pc] <= 0.0
+                and occupancy[pc] <= 0.0
+            ):
+                continue
+
+            print(
+                f"    {PC_NAMES[pc]:3s} "
+                f"weight={weights[pc]:.6f} "
+                f"occupancy={occupancy[pc]:.6f}"
+            )
+
+        print()
+        print("  GENERATED NOTES")
+
+        if not overlapping:
+
+            print("    [none]")
+
+        else:
+
+            for item in overlapping:
+
+                print(
+                    f"    "
+                    f"{_diagnostic_pitch_name(item['pitch']):6s} "
+                    f"{item['start']:8.3f}"
+                    f" -> "
+                    f"{item['end']:8.3f}"
+                    f"   overlap={item['overlap']:.3f}"
+                )
+
+def _diagnostic_pitch_name(pitch):
+    """
+    Human-readable MIDI pitch name.
+    MIDI 60 = C4.
+    """
+    octave = pitch // 12 - 1
+    return f"{PC_NAMES[pitch % 12]}{octave}"
+
+
+def print_truth_raw_accompaniment_trace(
+    local_notes,
+    hops,
+    chord_states,
+    emissions,
+    bpm,
+):
+    """
+    Diagnostic only.
+
+    Inspect the ACTUAL generated CP accompaniment content feeding selected
+    16-step harmonic-analysis windows.
+
+    This sits upstream of Viterbi and boundary refinement.
+
+    For each selected hop it prints:
+
+        - truth/reference family
+        - exact 16-step analysis window
+        - every generated note overlapping that window
+        - note start/end in generated-local sixteenth-note steps
+        - overlap with the window
+        - the sqrt(overlap) contribution used by
+          _weighted_pitch_classes()
+        - final normalized pitch-class weights
+        - pitch-class occupancies
+        - raw LOCAL family_score() values
+        - final build_decoder_evidence() emission values
+        - winner / truth comparison
+
+    This lets us separate:
+
+        MODEL CONTENT
+            generated notes really imply Gm / Eb / Cm / etc.
+
+    from:
+
+        ANALYSIS / SCORER
+            generated notes imply something else, but the pitch-class
+            weighting/family scorer misinterprets them.
+
+    Local generated step 0 = bar 3 beat 1.
+    """
+
+    # ------------------------------------------------------------------
+    # Focused diagnostic locations.
+    #
+    # These include the most informative ambiguous/wrong landmarks from
+    # P1/P2 plus surrounding points.
+    # ------------------------------------------------------------------
+
+    diagnostic_steps = [
+        320,
+        324,
+        328,
+        332,
+
+        336,
+        340,
+        344,
+        348,
+
+        352,
+        356,
+        360,
+        364,
+
+        368,
+        372,
+        376,
+        380,
+
+        384,
+        388,
+        392,
+        396,
+
+        400,
+        404,
+        408,
+        412,
+
+        416,
+        420,
+        424,
+        428,
+
+        432,
+        436,
+        440,
+        444,
+
+        448,
+        452,
+    ]
+
+    truth_cycle = [
+        "D#:maj",
+        "A#:maj",
+        "C:min",
+        "G#:maj",
+    ]
+
+    core_labels = [
+        "C:min",
+        "D#:maj",
+        "A#:maj",
+        "G#:maj",
+    ]
+
+    state_index_by_label = {
+        state["label"]: i
+        for i, state in enumerate(chord_states)
+    }
+
+    hop_index_by_step = {
+        int(hop["start"]): i
+        for i, hop in enumerate(hops)
+    }
+
+    sixteenth = 60.0 / bpm / 4.0
+
+    # Convert the decoded CP notes into EXACTLY the same step coordinates
+    # used by build_pitch_class_hops().
+    note_intervals = []
+
+    for note in local_notes:
+        start_step = note.start / sixteenth
+        end_step = note.end / sixteenth
+
+        if end_step <= start_step:
+            continue
+
+        note_intervals.append({
+            "pitch": int(note.pitch),
+            "pc": int(note.pitch) % 12,
+            "start": float(start_step),
+            "end": float(end_step),
+        })
+
+    print()
+    print("=" * 110)
+    print("RAW GENERATED ACCOMPANIMENT / PITCH-CLASS TRACE")
+    print("=" * 110)
+    print(
+        "Diagnostic only: decoded CP notes -> 16-step weighting -> "
+        "family_score -> final emission."
+    )
+    print(
+        "No Viterbi / refinement / reconstruction information is used here."
+    )
+
+    for step in diagnostic_steps:
+
+        hop_index = hop_index_by_step.get(step)
+
+        if hop_index is None:
+            print()
+            print(f"STEP {step}: [NO EXACT HOP]")
+            continue
+
+        hop = hops[hop_index]
+
+        window_start = float(hop["start"])
+        window_end = float(hop["analysis_end"])
+
+        truth_bar_offset = (
+            (step - 320) // 16
+        )
+
+        truth_label = truth_cycle[
+            truth_bar_offset % len(truth_cycle)
+        ]
+
+        # --------------------------------------------------------------
+        # Rank final emissions exactly as the decoder sees them.
+        # --------------------------------------------------------------
+
+        ranked_indices = sorted(
+            range(len(chord_states)),
+            key=lambda idx: float(
+                emissions[hop_index, idx]
+            ),
+            reverse=True,
+        )
+
+        winner_index = ranked_indices[0]
+        winner_state = chord_states[winner_index]
+        winner_label = winner_state["label"]
+
+        truth_index = state_index_by_label[truth_label]
+
+        winner_emission = float(
+            emissions[hop_index, winner_index]
+        )
+
+        truth_emission = float(
+            emissions[hop_index, truth_index]
+        )
+
+        truth_rank = (
+            ranked_indices.index(truth_index)
+            + 1
+        )
+
+        # --------------------------------------------------------------
+        # Extract all actual CP notes that overlap this analysis window.
+        # --------------------------------------------------------------
+
+        overlapping = []
+
+        for item in note_intervals:
+
+            overlap = max(
+                0.0,
+                min(item["end"], window_end)
+                - max(item["start"], window_start),
+            )
+
+            if overlap <= 0.0:
+                continue
+
+            contribution = math.sqrt(
+                max(overlap, 1.0)
+            )
+
+            overlapping.append({
+                **item,
+                "overlap": overlap,
+                "contribution": contribution,
+            })
+
+        overlapping.sort(
+            key=lambda x: (
+                x["start"],
+                x["pitch"],
+                x["end"],
+            )
+        )
+
+        print()
+        print("-" * 110)
+
+        boundary_marker = (
+            "  <REFERENCE BOUNDARY>"
+            if (
+                step >= 320
+                and (step - 320) % 16 == 0
+            )
+            else ""
+        )
+
+        print(
+            f"STEP {step}"
+            f"   truth={truth_label}"
+            f"   window=[{window_start:.1f}, {window_end:.1f})"
+            f"{boundary_marker}"
+        )
+
+        print(
+            f"  emission winner: "
+            f"{winner_label} {winner_emission:+.6f}"
+        )
+
+        print(
+            f"  reference:       "
+            f"{truth_label} {truth_emission:+.6f}"
+            f"   rank={truth_rank}"
+            f"   gap={winner_emission - truth_emission:+.6f}"
+        )
+
+        # --------------------------------------------------------------
+        # Actual generated notes.
+        # --------------------------------------------------------------
+
+        print()
+        print("  GENERATED NOTES OVERLAPPING WINDOW")
+
+        if not overlapping:
+            print("    [none]")
+
+        else:
+            print(
+                "    pitch   pc    note_start   note_end   "
+                "overlap   sqrt(overlap)"
+            )
+
+            for item in overlapping:
+
+                print(
+                    f"    "
+                    f"{_diagnostic_pitch_name(item['pitch']):6s}  "
+                    f"{PC_NAMES[item['pc']]:3s}  "
+                    f"{item['start']:10.3f}  "
+                    f"{item['end']:8.3f}  "
+                    f"{item['overlap']:7.3f}  "
+                    f"{item['contribution']:13.6f}"
+                )
+
+        # --------------------------------------------------------------
+        # Pitch-class evidence actually stored in the hop.
+        # --------------------------------------------------------------
+
+        print()
+        print("  PITCH-CLASS EVIDENCE")
+
+        print(
+            "    pc       weight      occupancy     "
+            "persistent   strong"
+        )
+
+        weights = hop["weights"]
+        occupancy = hop["occupancy"]
+
+        for pc in range(12):
+
+            # Print PCs that have any evidence, plus anything explicitly
+            # classified as persistent/strong.
+            if (
+                weights[pc] <= 0.0
+                and occupancy[pc] <= 0.0
+                and pc not in hop["persistent"]
+                and pc not in hop["strong"]
+            ):
+                continue
+
+            print(
+                f"    {PC_NAMES[pc]:3s}   "
+                f"{weights[pc]:10.6f}   "
+                f"{occupancy[pc]:10.6f}     "
+                f"{'YES' if pc in hop['persistent'] else 'no ':10s}   "
+                f"{'YES' if pc in hop['strong'] else 'no'}"
+            )
+
+        # --------------------------------------------------------------
+        # Recompute PURE LOCAL family scores.
+        #
+        # emissions[] contains:
+        #
+        #     local family score + tiny tonal prior
+        #
+        # Printing both tells us whether any discrepancy is coming from
+        # the pitch-class scorer itself or merely from the tonal bonus.
+        # --------------------------------------------------------------
+
+        print()
+        print("  FAMILY SCORE BREAKDOWN")
+        print(
+            "    family       local_score    final_emission    "
+            "tonal_delta"
+        )
+
+        labels_to_show = list(core_labels)
+
+        if winner_label not in labels_to_show:
+            labels_to_show.append(winner_label)
+
+        # Also show top-five emission families.  This is useful when the
+        # interesting alternative is neither truth nor the winner.
+        for idx in ranked_indices[:5]:
+            label = chord_states[idx]["label"]
+
+            if label not in labels_to_show:
+                labels_to_show.append(label)
+
+        for label in labels_to_show:
+
+            state_index = state_index_by_label[label]
+            state = chord_states[state_index]
+
+            local_score = family_score(
+                weights,
+                state["root"],
+                state["type"],
+            )
+
+            final_emission = float(
+                emissions[
+                    hop_index,
+                    state_index,
+                ]
+            )
+
+            tonal_delta = (
+                final_emission
+                - local_score
+            )
+
+            marker = ""
+
+            if label == winner_label:
+                marker += "  <WINNER>"
+
+            if label == truth_label:
+                marker += "  <REFERENCE>"
+
+            print(
+                f"    {label:9s}   "
+                f"{local_score:+11.6f}   "
+                f"{final_emission:+14.6f}   "
+                f"{tonal_delta:+11.6f}"
+                f"{marker}"
             )
 
 def decode_harmonic_sequence(
@@ -2946,11 +4132,31 @@ def generate(
             key_map,
         )
 
-        print_truth_landmark_emissions(
-            hops,
-            chord_states,
-            emissions,
-        )
+        # print_truth_landmark_emissions(
+        #     hops,
+        #     chord_states,
+        #     emissions,
+        # )
+
+        # print_truth_temporal_emission_trace(
+        #             hops,
+        #             chord_states,
+        #             emissions,
+        #         )
+
+        # print_truth_raw_accompaniment_trace(
+        #     local_notes,
+        #     hops,
+        #     chord_states,
+        #     emissions,
+        #     bpm,
+        # )
+
+        # print_truth_four_step_harmonic_trace(
+        #     local_notes,
+        #     chord_states,
+        #     bpm,
+        # )
 
         states = decode_harmonic_sequence(
             hops,
@@ -2970,6 +4176,14 @@ def generate(
             emissions,
             melody_structure,
             key_map,
+        )
+
+        print_viterbi_vs_emission_diagnostics(
+            hops,
+            chord_states,
+            emissions,
+            raw_viterbi_states,
+            states,
         )
 
         print_refinement_diagnostics(
