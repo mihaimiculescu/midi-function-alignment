@@ -868,7 +868,8 @@ def train(
     early_stopping_patience,
     max_steps,
     train_set_loader,
-    val_set_loader
+    val_set_loader,
+    resume_from_checkpoint=None
 ):
 
     n_gpus = max(
@@ -930,12 +931,66 @@ def train(
     )
 
     net.strict_loading = False
+#OLD
+    # trainer.fit(
+    #     net,
+    #     train_set_loader,
+    #     val_set_loader,
+    #     ckpt_path=resume_from_checkpoint
+    # )
 
+    # shutil.copy(
+    #     checkpoint_callback.best_model_path,
+    #     f'ckpt/{model_name}.epoch=best.ckpt'
+    # )
+
+    # os.chmod(
+    #     f'ckpt/{model_name}.epoch=best.ckpt',
+    #     0o666
+    # )
+
+    # shutil.copy(
+    #     f'ckpt/{model_name}/last.ckpt',
+    #     f'ckpt/{model_name}.epoch=last.ckpt'
+    # )
+
+    # os.chmod(
+    #     f'ckpt/{model_name}.epoch=last.ckpt',
+    #     0o666
+    # )
+#END OLD
+#NEW
     trainer.fit(
         net,
         train_set_loader,
-        val_set_loader
+        val_set_loader,
+        ckpt_path=resume_from_checkpoint
     )
+
+    # ------------------------------------------------------------
+    # Save the ACTUAL final training state unconditionally.
+    #
+    # Do not rely on ModelCheckpoint(save_last=True), because with
+    # step-based validation + top-k monitoring it may leave
+    # last.ckpt pointing to an earlier validation checkpoint.
+    # ------------------------------------------------------------
+
+    final_checkpoint_path = (
+        f'ckpt/{model_name}/last.ckpt'
+    )
+
+    trainer.save_checkpoint(
+        final_checkpoint_path
+    )
+
+    os.chmod(
+        final_checkpoint_path,
+        0o666
+    )
+
+    # ------------------------------------------------------------
+    # Export best checkpoint.
+    # ------------------------------------------------------------
 
     shutil.copy(
         checkpoint_callback.best_model_path,
@@ -947,8 +1002,12 @@ def train(
         0o666
     )
 
+    # ------------------------------------------------------------
+    # Export actual final checkpoint.
+    # ------------------------------------------------------------
+
     shutil.copy(
-        f'ckpt/{model_name}/last.ckpt',
+        final_checkpoint_path,
         f'ckpt/{model_name}.epoch=last.ckpt'
     )
 
@@ -956,7 +1015,7 @@ def train(
         f'ckpt/{model_name}.epoch=last.ckpt',
         0o666
     )
-
+#END NEW
 
 # ============================================================
 # MAIN
@@ -998,6 +1057,12 @@ def main():
 
     args.add_argument(
         '--weights_path',
+        type=str,
+        default=None
+    )
+
+    args.add_argument(
+        '--resume_from_checkpoint',
         type=str,
         default=None
     )
@@ -1250,7 +1315,8 @@ def main():
         args.early_stopping_patience,
         args.max_steps,
         train_set_loader,
-        val_set_loader
+        val_set_loader,
+        resume_from_checkpoint=args.resume_from_checkpoint
     )
 
 

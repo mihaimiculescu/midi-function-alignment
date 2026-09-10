@@ -65,6 +65,7 @@ MAX_VOICING_NOTES = 4
 TYPE_CHANGE_PENALTY = 0.07
 
 # Short horizon: actual chord identity / agility.
+# CHORD_WINDOW = 8 #BEST SO FAR
 CHORD_WINDOW = 8
 SKELETON_HOP = 4
 
@@ -562,6 +563,437 @@ def create_melody_chord_input(input_path, output_path, key):
 
     return metadata
 
+def create_conditioning_ablation_midi(
+    input_path,
+    output_path,
+    mode,
+    seed=0,
+):
+    """
+    Create a diagnostic conditioning variant of the already-synthetic
+    two-track MIDI.
+
+    Track 0 = melody conditioning
+    Track 1 = tonic chord prompt
+
+    Modes
+    -----
+    normal
+        Exact copy.
+
+    octave-up
+        Shift every melody note by +12 semitones.
+        Rhythm, durations, contour and pitch classes are unchanged.
+
+    pitch-shuffle
+        Preserve every note onset and duration exactly, but shuffle the
+        melody pitches among note instances.
+
+        This preserves:
+            - rhythm
+            - note count
+            - durations
+            - onset positions
+            - global pitch inventory
+
+        while destroying:
+            - local pitch sequence
+            - melodic contour
+            - local pitch/rhythm association
+
+    Diagnostic only.
+    """
+
+    if mode not in (
+        "normal",
+        "octave-up",
+        "octave-down",
+        "pitch-shuffle",
+        "rhythm-shuffle",
+    ):
+        raise ValueError(
+            f"Unsupported conditioning ablation: {mode}"
+        )
+
+    midi = mido.MidiFile(input_path)
+
+    if len(midi.tracks) < 2:
+        raise ValueError(
+            "Conditioning-ablation MIDI must contain "
+            "melody track 0 and prompt track 1."
+        )
+
+    if mode == "normal":
+        midi.save(output_path)
+        return
+
+    melody_track = midi.tracks[0]
+
+    # ------------------------------------------------------------
+    # Simple octave shift.
+    # ------------------------------------------------------------
+
+    if mode in ("octave-up", "octave-down"):
+        new_track = mido.MidiTrack()
+
+        shift = 12 if mode == "octave-up" else -12
+
+        for msg in melody_track:
+            if msg.type in ("note_on", "note_off"):
+                new_pitch = int(msg.note) + shift
+
+                if not 0 <= new_pitch <= 127:
+                    raise ValueError(
+                        f"{mode} ablation would exceed MIDI "
+                        f"pitch range: {msg.note} -> {new_pitch}"
+                    )
+
+                new_track.append(
+                    msg.copy(note=new_pitch)
+                )
+            else:
+                new_track.append(msg.copy())
+
+        midi.tracks[0] = new_track
+        midi.save(output_path)
+        return
+
+    if mode == "rhythm-shuffle":
+        ticks_per_beat = midi.ticks_per_beat
+
+        absolute_time = 0
+        events = []
+
+        for message_index, msg in enumerate(melody_track):
+            absolute_time += msg.time
+
+            events.append(
+                {
+                    "index": message_index,
+                    "time": absolute_time,
+                    "msg": msg,
+                }
+            )
+
+        active = {}
+        note_instances = []
+
+        for event in events:
+            msg = event["msg"]
+
+            is_note_on = (
+                msg.type == "note_on"
+                and msg.velocity > 0
+            )
+
+            is_note_off = (
+                msg.type == "note_off"
+                or (
+                    msg.type == "note_on"
+                    and msg.velocity == 0
+                )
+            )
+
+            if is_note_on:
+                key = (
+                    int(getattr(msg, "channel", 0)),
+                    int(msg.note),
+                )
+
+                active.setdefault(key, []).append(event)
+
+            elif is_note_off:
+                key = (
+                    int(getattr(msg, "channel", 0)),
+                    int(msg.note),
+                )
+
+                queue = active.get(key)
+
+                if not queue:
+                    raise RuntimeError(
+                        "Unmatched melody note-off while building "
+                        "rhythm-shuffle ablation: "
+                        f"message={event['index']}, pitch={msg.note}"
+                    )
+
+                on_event = queue.pop(0)
+
+                start = int(on_event["time"])
+                end = int(event["time"])
+
+                duration = max(1, end - start)
+
+                note_instances.append(
+                    {
+                        "pitch": int(msg.note),
+                        "channel": int(
+                            getattr(msg, "channel", 0)
+                        ),
+                        "velocity": int(
+                            on_event["msg"].velocity
+                        ),
+                        "release_velocity": int(
+                            getattr(msg, "velocity", 0)
+                        ),
+                        "start": start,
+                        "duration": duration,
+                    }
+                )
+
+        leftovers = sum(
+            len(queue)
+            for queue in active.values()
+        )
+
+        if leftovers:
+            raise RuntimeError(
+                "Unmatched melody note-ons while building "
+                f"rhythm-shuffle ablation: {leftovers}"
+            )
+
+        if not note_instances:
+            raise RuntimeError(
+                "No melody note instances found for rhythm shuffle."
+            )
+
+        original_starts = np.array(
+            [
+                item["start"]
+                for item in note_instances
+            ],
+            dtype=np.int64,
+        )
+
+        rng = np.random.default_rng(seed)
+
+        shuffled_starts = rng.permutation(
+            original_starts
+        )
+
+        new_note_events = []
+
+        for item, new_start in zip(
+            note_instances,
+            shuffled_starts,
+        ):
+            new_start = int(new_start)
+
+            new_end = (
+                new_start
+                + int(item["duration"])
+            )
+
+            new_note_events.append(
+                (
+                    new_start,
+                    1,
+                    mido.Message(
+                        "note_on",
+                        note=item["pitch"],
+                        velocity=item["velocity"],
+                        channel=item["channel"],
+                        time=0,
+                    ),
+                )
+            )
+
+            new_note_events.append(
+                (
+                    new_end,
+                    0,
+                    mido.Message(
+                        "note_off",
+                        note=item["pitch"],
+                        velocity=item["release_velocity"],
+                        channel=item["channel"],
+                        time=0,
+                    ),
+                )
+            )
+
+        metadata_events = []
+
+        absolute_time = 0
+
+        for msg in melody_track:
+            absolute_time += msg.time
+
+            if msg.type not in (
+                "note_on",
+                "note_off",
+            ):
+                if msg.type != "end_of_track":
+                    metadata_events.append(
+                        (
+                            absolute_time,
+                            -1,
+                            msg.copy(time=0),
+                        )
+                    )
+
+        combined = (
+            metadata_events
+            + new_note_events
+        )
+
+        combined.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+            )
+        )
+
+        new_track = mido.MidiTrack()
+
+        previous_time = 0
+
+        for event_time, _, msg in combined:
+            delta = int(
+                event_time
+                - previous_time
+            )
+
+            new_track.append(
+                msg.copy(time=max(0, delta))
+            )
+
+            previous_time = int(event_time)
+
+        new_track.append(
+            mido.MetaMessage(
+                "end_of_track",
+                time=0,
+            )
+        )
+
+        midi.tracks[0] = new_track
+        midi.save(output_path)
+        return
+
+    # ------------------------------------------------------------
+    # Pitch shuffle.
+    #
+    # We pair every note-on with its corresponding note-off using
+    # message indices. Then we shuffle complete note-instance pitches,
+    # assigning the same new pitch to both messages.
+    # ------------------------------------------------------------
+    active = {}
+    note_instances = []
+
+    for message_index, msg in enumerate(melody_track):
+
+        is_note_on = (
+            msg.type == "note_on"
+            and msg.velocity > 0
+        )
+
+        is_note_off = (
+            msg.type == "note_off"
+            or (
+                msg.type == "note_on"
+                and msg.velocity == 0
+            )
+        )
+
+        if is_note_on:
+            key = (
+                int(getattr(msg, "channel", 0)),
+                int(msg.note),
+            )
+
+            active.setdefault(key, []).append(
+                message_index
+            )
+
+        elif is_note_off:
+            key = (
+                int(getattr(msg, "channel", 0)),
+                int(msg.note),
+            )
+
+            queue = active.get(key)
+
+            if not queue:
+                raise RuntimeError(
+                    "Unmatched melody note-off while building "
+                    "pitch-shuffle ablation: "
+                    f"message={message_index}, pitch={msg.note}"
+                )
+
+            on_index = queue.pop(0)
+
+            note_instances.append(
+                {
+                    "on_index": on_index,
+                    "off_index": message_index,
+                    "pitch": int(msg.note),
+                }
+            )
+
+    leftovers = sum(
+        len(queue)
+        for queue in active.values()
+    )
+
+    if leftovers:
+        raise RuntimeError(
+            "Unmatched melody note-ons while building "
+            f"pitch-shuffle ablation: {leftovers}"
+        )
+
+    if not note_instances:
+        raise RuntimeError(
+            "No melody note instances found for pitch shuffle."
+        )
+
+    original_pitches = np.array(
+        [
+            item["pitch"]
+            for item in note_instances
+        ],
+        dtype=np.int16,
+    )
+
+    rng = np.random.default_rng(seed)
+
+    shuffled_pitches = rng.permutation(
+        original_pitches
+    )
+
+    replacement_pitch = {}
+
+    for item, new_pitch in zip(
+        note_instances,
+        shuffled_pitches,
+    ):
+        replacement_pitch[
+            item["on_index"]
+        ] = int(new_pitch)
+
+        replacement_pitch[
+            item["off_index"]
+        ] = int(new_pitch)
+
+    new_track = mido.MidiTrack()
+
+    for message_index, msg in enumerate(
+        melody_track
+    ):
+        if message_index in replacement_pitch:
+            new_track.append(
+                msg.copy(
+                    note=replacement_pitch[
+                        message_index
+                    ]
+                )
+            )
+        else:
+            new_track.append(msg.copy())
+
+    midi.tracks[0] = new_track
+
+    midi.save(output_path)
 
 def get_original_melody(path):
     """
@@ -747,6 +1179,61 @@ def chord_score(weights, root, typ):
         score -= 0.035
 
     return float(score)
+
+def print_major_family_score_microscope(
+    weights,
+    root,
+    label,
+):
+    """
+    Diagnostic only.
+
+    Shows exactly why a major-family state receives its family_score().
+    """
+
+    pc_names = [
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B",
+    ]
+
+    root_pc = root % 12
+    third_pc = (root + 4) % 12
+    fifth_pc = (root + 7) % 12
+
+    print()
+    print(
+        f"  === FAMILY SCORE MICROSCOPE: "
+        f"{label} ==="
+    )
+
+    print(
+        f"  root={pc_names[root_pc]}  "
+        f"third={pc_names[third_pc]}  "
+        f"fifth={pc_names[fifth_pc]}"
+    )
+
+    for typ in ("maj", "maj7", "7"):
+        score = chord_score(
+            weights,
+            root,
+            typ,
+        )
+
+        print(
+            f"  {typ:4s}: "
+            f"{score:+.9f}"
+        )
+
+    family = family_score(
+        weights,
+        root,
+        "maj",
+    )
+
+    print(
+        f"  family_score({label}) = "
+        f"{family:+.9f}"
+    )
 
 def family_score(weights, root, typ):
     """
@@ -2343,6 +2830,137 @@ def print_truth_four_step_harmonic_trace(
                     f"   overlap={item['overlap']:.3f}"
                 )
 
+def print_pitch_class_microscope(
+    notes,
+    bpm,
+    start_step,
+    window_steps,
+):
+    """
+    Diagnostic only.
+
+    Prints every generated note that contributes to one harmonic-analysis
+    window, using the exact overlap/weighting logic of
+    _weighted_pitch_classes().
+    """
+
+    end_step = start_step + window_steps
+    sixteenth = 60.0 / float(bpm) / 4.0
+
+    pc_names = [
+        "C", "C#", "D", "D#", "E", "F",
+        "F#", "G", "G#", "A", "A#", "B",
+    ]
+
+    raw_weights = np.zeros(12, dtype=np.float64)
+    raw_occupancy = np.zeros(12, dtype=np.float64)
+
+    print()
+    print("  === PITCH-CLASS MICROSCOPE ===")
+    print(
+        f"  analysis window: "
+        f"[{start_step}, {end_step}) steps"
+    )
+    print()
+    print(
+        "  pitch  pc    note_steps                    "
+        "overlap       sqrt-weight"
+    )
+    print(
+        "  -----  ----  ----------------------------  "
+        "------------  ------------"
+    )
+
+    contributors = []
+
+    for note in notes:
+        a = note.start / sixteenth
+        b = note.end / sixteenth
+        pc = note.pitch % 12
+
+        overlap = max(
+            0.0,
+            min(b, end_step) - max(a, start_step),
+        )
+
+        # Must match the production epsilon fix exactly.
+        if overlap <= 1e-6:
+            continue
+
+        contribution = math.sqrt(max(overlap, 1.0))
+
+        raw_weights[pc] += contribution
+        raw_occupancy[pc] += overlap
+
+        contributors.append(
+            (
+                note.pitch,
+                pc,
+                a,
+                b,
+                overlap,
+                contribution,
+            )
+        )
+
+    contributors.sort(
+        key=lambda x: (x[2], x[0], x[3])
+    )
+
+    for (
+        pitch,
+        pc,
+        a,
+        b,
+        overlap,
+        contribution,
+    ) in contributors:
+        print(
+            f"  {pitch:5d}  "
+            f"{pc_names[pc]:4s}  "
+            f"[{a:9.4f}, {b:9.4f})  "
+            f"{overlap:12.6f}  "
+            f"{contribution:12.6f}"
+        )
+
+    normalized_weights = raw_weights.copy()
+
+    total = normalized_weights.sum()
+    if total:
+        normalized_weights /= total
+
+    occupancy = (
+        raw_occupancy /
+        float(window_steps)
+    )
+
+    print()
+    print("  Raw PC weight totals:")
+    for pc in range(12):
+        if raw_weights[pc] > 0:
+            print(
+                f"    {pc_names[pc]:3s}: "
+                f"{raw_weights[pc]:.9f}"
+            )
+
+    print()
+    print("  Normalized PC weights:")
+    for pc in range(12):
+        print(
+            f"    {pc_names[pc]:3s}: "
+            f"{normalized_weights[pc]:.9f}"
+        )
+
+    print()
+    print("  PC occupancy:")
+    for pc in range(12):
+        print(
+            f"    {pc_names[pc]:3s}: "
+            f"{occupancy[pc]:.9f}"
+        )
+
+    return normalized_weights, occupancy
+
 def _diagnostic_pitch_name(pitch):
     """
     Human-readable MIDI pitch name.
@@ -3892,6 +4510,7 @@ def generate(
     vicinity_fraction,
     prompt_key,
     conditioning_multiplier,
+    conditioning_ablation,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -3905,6 +4524,7 @@ def generate(
     print(f"Samples:            {samples}")
     print(f"Seed:               {seed}")
     print(f"Conditioning mult.: {conditioning_multiplier}")
+    print(f"Conditioning mode:  {conditioning_ablation}")
     print(f"Chord window:       {CHORD_WINDOW} steps")
     print(f"Key context:        {KEY_CONTEXT_WINDOW} steps")
     print(f"Skeleton hop:       {SKELETON_HOP} steps")
@@ -4129,6 +4749,46 @@ def generate(
             f"{len(hops)}"
         )
 
+        # ------------------------------------------------------------
+        # DIAGNOSTIC: P1 / step 368 harmonic microscope
+        # ------------------------------------------------------------
+        # if sample_index == 1:
+        #     microscope_weights, microscope_occupancy = (
+        #         print_pitch_class_microscope(
+        #             notes=local_notes,
+        #             bpm=bpm,
+        #             start_step=368,
+        #             window_steps=CHORD_WINDOW,
+        #         )
+        #     )
+
+        #     target_hop = next(
+        #         hop for hop in hops
+        #         if hop["start"] == 368
+        #     )
+
+        #     print()
+        #     print(
+        #         "  microscope vs stored hop max |delta| = "
+        #         f"{np.max(np.abs(
+        #             microscope_weights -
+        #             target_hop['weights']
+        #         )):.12g}"
+        #     )
+
+        #     print_major_family_score_microscope(
+        #         microscope_weights,
+        #         root=3,   # D# / Eb
+        #         label="D#:maj (Eb)",
+        #     )
+
+        #     print_major_family_score_microscope(
+        #         microscope_weights,
+        #         root=8,   # G# / Ab
+        #         label="G#:maj (Ab)",
+        #     )
+
+
         chord_states = all_chord_states()
 
         emissions, key_confidences = build_decoder_evidence(
@@ -4302,6 +4962,28 @@ def main():
             "0.0 = disable melody cross-attention contribution."
         ),
     )
+    parser.add_argument(
+        "--conditioning-ablation",
+        choices=(
+            "normal",
+            "octave-up",
+            "octave-down",
+            "pitch-shuffle",
+            "rhythm-shuffle",
+        ),
+        default="normal",
+        help=(
+            "Diagnostic perturbation applied only to the melody "
+            "conditioning track before preprocessing. "
+            "'normal' = unchanged; "
+            "'octave-up' = melody +12 semitones; "
+            "'octave-down' = melody -12 semitones; "
+            "'pitch-shuffle' = preserve rhythm/durations but "
+            "shuffle pitches among note instances."
+            "'rhythm-shuffle' = preserve each note's pitch and "
+            "duration but shuffle its onset time."
+        ),
+    )
     parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
 
@@ -4367,6 +5049,33 @@ def main():
         args.key,
     )
 
+    conditioning_input = synthetic_input
+
+    if args.conditioning_ablation != "normal":
+        conditioning_input = os.path.join(
+            args.output_dir,
+            (
+                f"{base}_{safe_key}_prompt_"
+                f"{args.conditioning_ablation}.mid"
+            ),
+        )
+
+        create_conditioning_ablation_midi(
+            input_path=synthetic_input,
+            output_path=conditioning_input,
+            mode=args.conditioning_ablation,
+            seed=args.seed,
+        )
+
+    print(
+        f"Conditioning mode: {args.conditioning_ablation}"
+    )
+
+    if conditioning_input != synthetic_input:
+        print(
+            f"Conditioning MIDI: {conditioning_input}"
+        )
+
     print()
     print("Loading model...")
     print(args.model)
@@ -4407,7 +5116,8 @@ def main():
 
     generate(
         model=model,
-        input_midi=synthetic_input,
+        # input_midi=synthetic_input, #temporary changed
+        input_midi=conditioning_input,
         original_input_midi=args.input,
         output_dir=args.output_dir,
         bpm=bpm,
@@ -4419,6 +5129,7 @@ def main():
         vicinity_fraction=args.vicinity,
         prompt_key=args.key,
         conditioning_multiplier=args.conditioning_multiplier,
+        conditioning_ablation=args.conditioning_ablation,
     )
 
 
