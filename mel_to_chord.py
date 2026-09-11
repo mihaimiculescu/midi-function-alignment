@@ -53,10 +53,24 @@ CHORD_PROGRAM = 49
 CHORD_OCTAVE = 3
 
 MODEL_MAX_LENGTH = 384
+DEFAULT_GENERATION_OVERLAP = 192
+STAGE_E_DIAGNOSTICS = False
 
 LOWEST_OUTPUT_PITCH = 36    # C2
 HIGHEST_OUTPUT_PITCH = 67    # G4
 MAX_VOICING_NOTES = 4
+
+YINYANG_DIAGNOSTIC_HARMONIC_STEPS = (
+    320,
+    336,
+    352,
+    368,
+    384,
+    400,
+    416,
+    432,
+    448,
+)
 
 # ---------------------------------------------------------------------------
 # Harmonic decoder
@@ -96,7 +110,7 @@ LONG_REST_STEPS = 8
 # boundary to move backwards by up to two analysis hops.
 BOUNDARY_BACKTRACK_HOPS = 2
 # BOUNDARY_BACKTRACK_MARGIN = 0.040 # DEFAULT
-BOUNDARY_BACKTRACK_MARGIN = 0.0
+BOUNDARY_BACKTRACK_MARGIN = -0.02
 
 # Do not let a practically-zero-confidence inferred key keep exerting
 # transition resistance.
@@ -2055,6 +2069,148 @@ def print_truth_landmark_emissions(
                 f"    {rank:2d}. "
                 f"{label:8s} "
                 f"{score:+.6f}"
+            )
+
+def print_emission_margin_diagnostics(
+    hops,
+    chord_states,
+    emissions,
+):
+    """
+    Diagnostic only.
+
+    For every harmonic hop, print:
+      - winning emission family
+      - winning score
+      - runner-up family
+      - runner-up score
+      - winner margin
+      - whether the winner changed from the previous hop
+
+    This changes absolutely nothing in decoding.
+    """
+    print()
+    print("  === EMISSION WINNER MARGINS: FULL SONG ===")
+    print(
+        "  step   winner        score    runner_up     score    "
+        "margin   CHANGE?"
+    )
+    print(
+        "  ----   ------------  -------  ------------  -------  "
+        "-------  -------"
+    )
+
+    previous_winner_index = None
+
+    margins = []
+    change_margins = []
+    stable_margins = []
+    winner_changes = 0
+
+    for i, hop in enumerate(hops):
+        ranked_indices = np.argsort(
+            emissions[i]
+        )[::-1]
+
+        winner_index = int(ranked_indices[0])
+        runner_index = int(ranked_indices[1])
+
+        winner = chord_states[winner_index]
+        runner = chord_states[runner_index]
+
+        winner_score = float(
+            emissions[i, winner_index]
+        )
+        runner_score = float(
+            emissions[i, runner_index]
+        )
+
+        margin = winner_score - runner_score
+
+        changed = (
+            previous_winner_index is not None
+            and winner_index != previous_winner_index
+        )
+
+        margins.append(margin)
+
+        if changed:
+            winner_changes += 1
+            change_margins.append(margin)
+        else:
+            stable_margins.append(margin)
+
+        print(
+            f"  {int(hop['start']):4d}   "
+            f"{winner['label']:12s}  "
+            f"{winner_score:+.3f}   "
+            f"{runner['label']:12s}  "
+            f"{runner_score:+.3f}   "
+            f"{margin:+.3f}   "
+            f"{'YES' if changed else '-'}"
+        )
+
+        previous_winner_index = winner_index
+
+    print()
+
+    if margins:
+        print(
+            f"  hops:                    {len(margins)}"
+        )
+        print(
+            f"  emission winner changes: {winner_changes}"
+        )
+        print(
+            f"  mean margin overall:     "
+            f"{np.mean(margins):.4f}"
+        )
+        print(
+            f"  median margin overall:   "
+            f"{np.median(margins):.4f}"
+        )
+
+    if change_margins:
+        print(
+            f"  mean margin on changes:  "
+            f"{np.mean(change_margins):.4f}"
+        )
+        print(
+            f"  median margin on changes:"
+            f" {np.median(change_margins):.4f}"
+        )
+
+    if stable_margins:
+        print(
+            f"  mean margin unchanged:   "
+            f"{np.mean(stable_margins):.4f}"
+        )
+        print(
+            f"  median margin unchanged: "
+            f"{np.median(stable_margins):.4f}"
+        )
+
+    weak_thresholds = (
+        0.01,
+        0.02,
+        0.05,
+        0.10,
+    )
+
+    if change_margins:
+        print()
+        print("  winner changes by margin:")
+
+        for threshold in weak_thresholds:
+            count = sum(
+                margin < threshold
+                for margin in change_margins
+            )
+
+            print(
+                f"    margin < {threshold:.2f}: "
+                f"{count}/{len(change_margins)} "
+                f"({100.0 * count / len(change_margins):.1f}%)"
             )
 
 def print_viterbi_vs_emission_diagnostics(
@@ -4492,6 +4648,192 @@ def write_final_midi(
 
     result.save(output_path)
 
+def print_stage_e_chunk_diagnostics(
+    chunk_number,
+    chunk_start,
+    chunk_end,
+    overlap,
+    melody_chunk,
+    full_melody,
+    prompt_batch=None,
+    expected_prompt_tokens=None,
+):
+    """
+    Passive chunk/seam diagnostic.
+
+    Verifies:
+      1. melody_chunk is exactly the intended slice of x1;
+      2. overlap prompt tokens are exactly the previously-generated tokens;
+      3. local/global coordinates at the seam are what we think they are.
+
+    Does not modify any tensor or generation state.
+    """
+
+    print()
+    print("=== STAGE E: CHUNK DIAGNOSTIC ===")
+    print(f"chunk number:             {chunk_number}")
+    print(f"global chunk range:       {chunk_start}:{chunk_end}")
+    print(f"chunk length:             {chunk_end - chunk_start}")
+    print(f"overlap:                  {overlap}")
+
+    if chunk_number == 1:
+        print("previous overlap prompt:  initial tonic prompt")
+    else:
+        print(
+            f"previous overlap range:   "
+            f"{chunk_start}:{chunk_start + overlap}"
+        )
+
+    # ---------------------------------------------------------------
+    # Verify that melody_chunk is literally the requested slice.
+    # ---------------------------------------------------------------
+
+    expected_melody = full_melody[
+        :,
+        chunk_start:chunk_end,
+    ]
+
+    melody_equal = torch.equal(
+        melody_chunk,
+        expected_melody,
+    )
+
+    if melody_chunk.numel() > 0:
+        melody_max_delta = float(
+            (
+                melody_chunk.float()
+                - expected_melody.float()
+            )
+            .abs()
+            .max()
+            .item()
+        )
+    else:
+        melody_max_delta = 0.0
+
+    print(
+        f"melody slice exact:       "
+        f"{melody_equal}"
+    )
+    print(
+        f"melody max delta:         "
+        f"{melody_max_delta:.9e}"
+    )
+
+    # ---------------------------------------------------------------
+    # Coordinate map.
+    # ---------------------------------------------------------------
+
+    print()
+    print("Coordinate map:")
+
+    interesting_local_steps = sorted(
+        set(
+            [
+                0,
+                min(overlap - 1, len(melody_chunk[0]) - 1),
+                overlap,
+                min(
+                    overlap + 1,
+                    len(melody_chunk[0]) - 1,
+                ),
+                len(melody_chunk[0]) - 1,
+            ]
+        )
+    )
+
+    for local_step in interesting_local_steps:
+        if (
+            local_step < 0
+            or local_step >= melody_chunk.shape[1]
+        ):
+            continue
+
+        global_step = (
+            chunk_start + local_step
+        )
+
+        print(
+            f"  local {local_step:4d}"
+            f" -> global {global_step:4d}"
+        )
+
+    # ---------------------------------------------------------------
+    # For later chunks verify that prompt_batch is literally the
+    # previously-generated overlap.
+    # ---------------------------------------------------------------
+
+    if (
+        chunk_number > 1
+        and prompt_batch is not None
+        and expected_prompt_tokens is not None
+    ):
+        print()
+        print("Overlap prompt verification:")
+
+        expected_batch = torch.cat(
+            expected_prompt_tokens,
+            dim=0,
+        )
+
+        same_shape = (
+            prompt_batch.shape
+            == expected_batch.shape
+        )
+
+        exact_equal = (
+            same_shape
+            and torch.equal(
+                prompt_batch,
+                expected_batch,
+            )
+        )
+
+        if same_shape:
+            max_delta = float(
+                (
+                    prompt_batch.float()
+                    - expected_batch.float()
+                )
+                .abs()
+                .max()
+                .item()
+            )
+        else:
+            max_delta = float("nan")
+
+        print(
+            f"  prompt shape:           "
+            f"{tuple(prompt_batch.shape)}"
+        )
+        print(
+            f"  expected shape:         "
+            f"{tuple(expected_batch.shape)}"
+        )
+        print(
+            f"  exact tensor equality:  "
+            f"{exact_equal}"
+        )
+        print(
+            f"  max tensor delta:       "
+            f"{max_delta:.9e}"
+        )
+
+        print(
+            f"  overlap global range:   "
+            f"{chunk_start}:"
+            f"{chunk_start + overlap}"
+        )
+
+        print(
+            f"  first NEW global step:  "
+            f"{chunk_start + overlap}"
+        )
+
+    print(
+        "=== END STAGE E DIAGNOSTIC ==="
+    )
+
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
@@ -4510,6 +4852,8 @@ def generate(
     vicinity_fraction,
     prompt_key,
     conditioning_multiplier,
+    yinyang_diagnostics,
+    generation_overlap,
     conditioning_ablation,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -4533,6 +4877,38 @@ def generate(
         "The old melody-vicinity attack filter is disabled. "
         "--vicinity remains only for CLI compatibility."
     )
+
+    if yinyang_diagnostics:
+        diagnostic_model_steps = {
+            int(prompt_length + step)
+            for step
+            in YINYANG_DIAGNOSTIC_HARMONIC_STEPS
+        }
+
+        print()
+        print(
+            "=== YINYANG DIAGNOSTIC TARGETS ==="
+        )
+        print(
+            "Harmonic steps: "
+            + ", ".join(
+                str(x)
+                for x
+                in YINYANG_DIAGNOSTIC_HARMONIC_STEPS
+            )
+        )
+        print(
+            "Model steps:    "
+            + ", ".join(
+                str(x)
+                for x
+                in sorted(
+                    diagnostic_model_steps
+                )
+            )
+        )
+    else:
+        diagnostic_model_steps = set()
 
     original_melody = get_original_melody(original_input_midi)
 
@@ -4613,7 +4989,21 @@ def generate(
         )
 
     final_outputs = [[] for _ in range(samples)]
-    overlap = prompt_length
+    # overlap = prompt_length
+    overlap = int(generation_overlap)
+
+    if overlap < prompt_length:
+        raise ValueError(
+            f"Generation overlap ({overlap}) must be at least "
+            f"the prompt length ({prompt_length})."
+        )
+
+    if overlap >= MODEL_MAX_LENGTH:
+        raise ValueError(
+            f"Generation overlap ({overlap}) must be smaller than "
+            f"MODEL_MAX_LENGTH ({MODEL_MAX_LENGTH})."
+        )    
+    print(f"Generation overlap:  {overlap}")
     chunk_start = 0
     previous_chunk_end = 0
     chunk_number = 1
@@ -4634,6 +5024,18 @@ def generate(
             f"CHUNK {chunk_number}: {chunk_start}:{chunk_end} "
             f"({chunk_end - chunk_start} steps)"
         )
+        if (
+            STAGE_E_DIAGNOSTICS
+            and chunk_number == 1
+        ):
+            print_stage_e_chunk_diagnostics(
+                chunk_number=chunk_number,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                overlap=overlap,
+                melody_chunk=melody_chunk,
+                full_melody=x1,
+            )
 
         if chunk_number == 1:
             torch.manual_seed(seed)
@@ -4646,6 +5048,15 @@ def generate(
                     x2.repeat(samples, 1, 1),
                     temperature=temperature,
                     multiplier=float(conditioning_multiplier),
+                    diagnostic_steps=(
+                        diagnostic_model_steps
+                    ),
+                    diagnostic_global_offset=(
+                        chunk_start
+                    ),
+                    diagnostic_prompt_length=(
+                        prompt_length
+                    ),
                 )
 
             for i in range(samples):
@@ -4669,6 +5080,34 @@ def generate(
                 prompts.append(torch.stack(tokens, dim=1))
 
             prompt_batch = torch.cat(prompts, dim=0)
+            if STAGE_E_DIAGNOSTICS:
+                expected_prompt_tokens = []
+
+                for sample_index in range(samples):
+                    expected_prompt_tokens.append(
+                        torch.stack(
+                            final_outputs[
+                                sample_index
+                            ][
+                                prompt_start:
+                                prompt_end
+                            ],
+                            dim=1,
+                        )
+                    )
+
+                print_stage_e_chunk_diagnostics(
+                    chunk_number=chunk_number,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    overlap=overlap,
+                    melody_chunk=melody_chunk,
+                    full_melody=x1,
+                    prompt_batch=prompt_batch,
+                    expected_prompt_tokens=(
+                        expected_prompt_tokens
+                    ),
+                )
 
             with torch.inference_mode():
                 output = model.global_sampling(
@@ -4676,6 +5115,16 @@ def generate(
                     prompt_batch,
                     temperature=temperature,
                     multiplier=float(conditioning_multiplier),
+
+                    diagnostic_steps=(
+                        diagnostic_model_steps
+                    ),
+                    diagnostic_global_offset=(
+                        chunk_start
+                    ),
+                    diagnostic_prompt_length=(
+                        prompt_length
+                    ),
                 )
 
             for i in range(samples):
@@ -4683,6 +5132,80 @@ def generate(
                     output[j][i:i + 1, :]
                     for j in range(len(output))
                 ]
+                if STAGE_E_DIAGNOSTICS:
+                    regenerated_overlap = (
+                        output_i[:overlap]
+                    )
+
+                    original_overlap = (
+                        final_outputs[i][
+                            chunk_start:
+                            chunk_start + overlap
+                        ]
+                    )
+
+                    if (
+                        len(regenerated_overlap)
+                        == len(original_overlap)
+                        == overlap
+                    ):
+                        equality = [
+                            torch.equal(a, b)
+                            for a, b in zip(
+                                regenerated_overlap,
+                                original_overlap,
+                            )
+                        ]
+
+                        differing = [
+                            index
+                            for index, equal
+                            in enumerate(equality)
+                            if not equal
+                        ]
+
+                        print()
+                        print(
+                            "=== STAGE E: "
+                            "REGENERATED OVERLAP ==="
+                        )
+                        print(
+                            f"sample:                   "
+                            f"{i + 1}"
+                        )
+                        print(
+                            f"overlap global range:     "
+                            f"{chunk_start}:"
+                            f"{chunk_start + overlap}"
+                        )
+                        print(
+                            f"identical CP steps:       "
+                            f"{sum(equality)}/{overlap}"
+                        )
+                        print(
+                            f"different CP steps:       "
+                            f"{len(differing)}/{overlap}"
+                        )
+
+                        if differing:
+                            print(
+                                "different local indices: "
+                                + ", ".join(
+                                    str(x)
+                                    for x in differing
+                                )
+                            )
+                        else:
+                            print(
+                                "different local indices: "
+                                "none"
+                            )
+
+                        print(
+                            "NOTE: regenerated overlap "
+                            "is discarded; original "
+                            "chunk-1 tokens are retained."
+                        )
                 final_outputs[i].extend(output_i[overlap:])
 
         previous_chunk_end = chunk_end
@@ -4797,11 +5320,17 @@ def generate(
             key_map,
         )
 
-        # print_truth_landmark_emissions(
-        #     hops,
-        #     chord_states,
-        #     emissions,
-        # )
+        print_emission_margin_diagnostics(
+            hops,
+            chord_states,
+            emissions,
+        )
+
+        print_truth_landmark_emissions(
+            hops,
+            chord_states,
+            emissions,
+        )
 
         # print_truth_temporal_emission_trace(
         #             hops,
@@ -4851,19 +5380,19 @@ def generate(
             states,
         )
 
-        print_refinement_diagnostics(
-            hops,
-            raw_viterbi_states,
-            states,
-        )
+        # print_refinement_diagnostics(
+        #     hops,
+        #     raw_viterbi_states,
+        #     states,
+        # )
 
-        print_boundary_diagnostics(
-            hops,
-            states,
-            chord_states,
-            emissions,
-            melody_structure,
-        )
+        # print_boundary_diagnostics(
+        #     hops,
+        #     states,
+        #     chord_states,
+        #     emissions,
+        #     melody_structure,
+        # )
 
         family_regions = merge_regions(
             hops,
@@ -4951,6 +5480,16 @@ def main():
         default=None,
         help="16th-note steps; defaults to input MIDI length.",
     )
+    parser.add_argument(
+    "--generation-overlap",
+    type=int,
+    default=DEFAULT_GENERATION_OVERLAP,
+    help=(
+        "Number of previously generated CP steps reused as the "
+        "prompt/context for each subsequent generation chunk. "
+        f"Default: {DEFAULT_GENERATION_OVERLAP}."
+    ),
+)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument(
         "--conditioning-multiplier",
@@ -4994,7 +5533,16 @@ def main():
         default=DEFAULT_VICINITY,
         help="Retained for compatibility; no longer filters CP attacks.",
     )
-
+    parser.add_argument(
+        "--yinyang-diagnostics",
+        action="store_true",
+        help=(
+            "Print passive YinYang attention "
+            "and conditioning-contribution "
+            "diagnostics at selected harmonic "
+            "landmarks."
+        ),
+    )
     args = parser.parse_args()
 
     if args.samples < 1:
@@ -5130,6 +5678,8 @@ def main():
         prompt_key=args.key,
         conditioning_multiplier=args.conditioning_multiplier,
         conditioning_ablation=args.conditioning_ablation,
+        yinyang_diagnostics=args.yinyang_diagnostics,
+        generation_overlap=args.generation_overlap,
     )
 
 

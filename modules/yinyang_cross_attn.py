@@ -71,10 +71,59 @@ class LowRankMultiheadAttention(nn.Module):
                 attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # Shape becomes (1, 1, t_q, t_k)
             attn_weights = attn_weights + attn_mask
 
+        # attn_weights = F.softmax(attn_weights, dim=-1)
+        # attn_weights = self.attn_dropout(attn_weights)
+
+        # # Weighted sum of values
+        # attn_output = torch.matmul(attn_weights, value)
+        # attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
+        # return self.out_proj(attn_output) * self.gates
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.attn_dropout(attn_weights)
 
-        # Weighted sum of values
-        attn_output = torch.matmul(attn_weights, value)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
-        return self.out_proj(attn_output) * self.gates
+        # ---------------------------------------------------------------
+        # PASSIVE DIAGNOSTIC CACHE
+        #
+        # Keep ONLY the newest query row.  global_sampling() is
+        # autoregressive, so this corresponds to the CP position currently
+        # being generated.
+        #
+        # Shapes:
+        #   last_attn_weights: [batch, heads, key_len]
+        # ---------------------------------------------------------------
+        self._diag_last_attn_weights = (
+            attn_weights[:, :, -1, :].detach()
+        )
+
+        # Weighted sum of values.
+        attn_output = torch.matmul(
+            attn_weights,
+            value,
+        )
+
+        attn_output = (
+            attn_output
+            .transpose(1, 2)
+            .contiguous()
+            .view(
+                batch_size,
+                -1,
+                self.embed_dim,
+            )
+        )
+
+        projected = self.out_proj(attn_output)
+
+        # Store the newest output before and after the learned gate.
+        self._diag_last_output_pre_gate = (
+            projected[:, -1, :].detach()
+        )
+
+        gated = projected * self.gates
+
+        self._diag_last_output_post_gate = (
+            gated[:, -1, :].detach()
+        )
+
+        return gated
+    

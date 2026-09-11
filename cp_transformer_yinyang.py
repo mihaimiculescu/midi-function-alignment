@@ -13,6 +13,7 @@ from modules.hubert import _compute_mask
 import sys
 from generator_helper import end_generator
 from yield_tags import Tags
+import math
 
 class RoformerYinyang(RoformerFineTune):
 
@@ -90,11 +91,417 @@ class RoformerYinyang(RoformerFineTune):
                 data2[1] = data2[1] + yinyang_weights
         return end_generator(gen2)
 
-    def global_sampling(self, x1, x2, temperature=1.0, multiplier=1.0, sampling_func=None):
+    def _print_yinyang_diagnostic(
+        self,
+        attn_module,
+        adapter_index,
+        model_global_step,
+        harmonic_step,
+        melody_global_offset,
+        base_state,
+        yinyang_state,
+        multiplier,
+        sample_index=0,
+    ):
+        """
+        Passive YinYang microscope.
+
+        Reports:
+          - where each head attends in the melody;
+          - local / past / future attention mass;
+          - attention entropy;
+          - magnitude of the gated conditioning contribution.
+
+        No model state or generation value is modified.
+        """
+
+        if not hasattr(
+            attn_module,
+            "_diag_last_attn_weights",
+        ):
+            return
+
+        weights = (
+            attn_module
+            ._diag_last_attn_weights[
+                sample_index
+            ]
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        # [heads, key_len]
+        num_heads, key_len = weights.shape
+
+        global_key_positions = torch.arange(
+            key_len,
+            dtype=torch.long,
+        ) + int(melody_global_offset)
+
+        base = (
+            base_state[
+                sample_index,
+                -1,
+                :
+            ]
+            .detach()
+            .float()
+        )
+
+        # yy = (
+        #     yinyang_state[
+        #         sample_index,
+        #         -1,
+        #         :
+        #     ]
+        #     .detach()
+        #     .float()
+        # )
+
+        # if isinstance(multiplier, torch.Tensor):
+        #     if multiplier.numel() == 1:
+        #         mult_value = float(
+        #             multiplier.detach().float().item()
+        #         )
+        #     else:
+        #         mult_value = float(
+        #             multiplier[
+        #                 sample_index
+        #             ]
+        #             .detach()
+        #             .float()
+        #             .reshape(-1)[0]
+        #             .item()
+        #         )
+        # else:
+        #     mult_value = float(multiplier)
+
+        # contribution = yy * mult_value
+        yy_post_gate = (
+            yinyang_state[
+                sample_index,
+                -1,
+                :
+            ]
+            .detach()
+            .float()
+        )
+
+        yy_pre_gate = (
+            attn_module
+            ._diag_last_output_pre_gate[
+                sample_index
+            ]
+            .detach()
+            .float()
+        )
+
+        yy_cached_post_gate = (
+            attn_module
+            ._diag_last_output_post_gate[
+                sample_index
+            ]
+            .detach()
+            .float()
+        )
+
+        if isinstance(multiplier, torch.Tensor):
+            if multiplier.numel() == 1:
+                mult_value = float(
+                    multiplier.detach().float().item()
+                )
+            else:
+                mult_value = float(
+                    multiplier[
+                        sample_index
+                    ]
+                    .detach()
+                    .float()
+                    .reshape(-1)[0]
+                    .item()
+                )
+        else:
+            mult_value = float(multiplier)
+
+        contribution = (
+            yy_post_gate * mult_value
+        )
+        base_norm = float(
+            torch.linalg.vector_norm(base).item()
+        )
+
+        # yy_norm = float(
+        #     torch.linalg.vector_norm(yy).item()
+        # )
+
+        # contribution_norm = float(
+        #     torch.linalg.vector_norm(
+        #         contribution
+        #     ).item()
+        # )
+        pre_gate_norm = float(
+            torch.linalg.vector_norm(
+                yy_pre_gate
+            ).item()
+        )
+
+        post_gate_norm = float(
+            torch.linalg.vector_norm(
+                yy_post_gate
+            ).item()
+        )
+
+        cached_post_gate_norm = float(
+            torch.linalg.vector_norm(
+                yy_cached_post_gate
+            ).item()
+        )
+
+        contribution_norm = float(
+            torch.linalg.vector_norm(
+                contribution
+            ).item()
+        )
+
+        gate_effect_ratio = (
+            post_gate_norm / pre_gate_norm
+            if pre_gate_norm > 1e-12
+            else float("nan")
+        )
+
+        cache_delta = float(
+            torch.max(
+                torch.abs(
+                    yy_post_gate
+                    - yy_cached_post_gate
+                )
+            ).item()
+        )
+
+        ratio = (
+            contribution_norm / base_norm
+            if base_norm > 1e-12
+            else float("nan")
+        )
+
+        gate = float(
+            attn_module
+            .gates
+            .detach()
+            .float()
+            .cpu()
+            .item()
+        )
+
+        print()
+        print(
+            "=== YINYANG MICROSCOPE ==="
+        )
+        print(
+            f"model step:       "
+            f"{model_global_step}"
+        )
+        print(
+            f"harmonic step:    "
+            f"{harmonic_step}"
+        )
+        print(
+            f"adapter:          "
+            f"{adapter_index:02d}"
+        )
+        print(
+            f"melody key range: "
+            f"{melody_global_offset}:"
+            f"{melody_global_offset + key_len}"
+        )
+        print(
+            f"gate:             "
+            f"{gate:+.8f}"
+        )
+        print(
+            f"multiplier:       "
+            f"{mult_value:.6f}"
+        )
+        print(
+            f"base norm:        "
+            f"{base_norm:.6f}"
+        )
+        # print(
+        #     f"YY norm:          "
+        #     f"{yy_norm:.6f}"
+        # )
+        # print(
+        #     f"actual contrib:   "
+        #     f"{contribution_norm:.6f}"
+        # )
+        # print(
+        #     f"contrib/base:     "
+        #     f"{ratio:.6f}"
+        # )
+        print(
+            f"pre-gate norm:    "
+            f"{pre_gate_norm:.6f}"
+        )
+        print(
+            f"post-gate norm:   "
+            f"{post_gate_norm:.6f}"
+        )
+        print(
+            f"post/pre:         "
+            f"{gate_effect_ratio:.6f}"
+        )
+        print(
+            f"actual contrib:   "
+            f"{contribution_norm:.6f}"
+        )
+        print(
+            f"contrib/base:     "
+            f"{ratio:.6f}"
+        )
+        print(
+            f"cache delta:      "
+            f"{cache_delta:.9e}"
+        )
+        for head in range(num_heads):
+            w = weights[head]
+
+            total = float(w.sum().item())
+
+            if total <= 0.0:
+                continue
+
+            # Renormalize defensively.  In eval mode dropout is inactive,
+            # but this makes the diagnostic numerically robust.
+            w = w / w.sum()
+
+            positions = (
+                global_key_positions.float()
+            )
+
+            mean_position = float(
+                (w * positions).sum().item()
+            )
+
+            eps = 1e-12
+
+            entropy = float(
+                -(
+                    w
+                    * torch.log(
+                        w.clamp_min(eps)
+                    )
+                )
+                .sum()
+                .item()
+            )
+
+            if key_len > 1:
+                normalized_entropy = (
+                    entropy
+                    / math.log(key_len)
+                )
+            else:
+                normalized_entropy = 0.0
+
+            past_mask = (
+                global_key_positions
+                < model_global_step
+            )
+
+            current_mask = (
+                global_key_positions
+                == model_global_step
+            )
+
+            future_mask = (
+                global_key_positions
+                > model_global_step
+            )
+
+            past_mass = float(
+                w[past_mask].sum().item()
+            )
+
+            current_mass = float(
+                w[current_mask].sum().item()
+            )
+
+            future_mass = float(
+                w[future_mask].sum().item()
+            )
+
+            def local_mass(radius):
+                mask = (
+                    torch.abs(
+                        global_key_positions
+                        - model_global_step
+                    )
+                    <= radius
+                )
+
+                return float(
+                    w[mask].sum().item()
+                )
+
+            k = min(8, key_len)
+
+            top_values, top_indices = (
+                torch.topk(
+                    w,
+                    k=k,
+                )
+            )
+
+            top_pairs = []
+
+            for value, index in zip(
+                top_values.tolist(),
+                top_indices.tolist(),
+            ):
+                global_pos = (
+                    int(melody_global_offset)
+                    + int(index)
+                )
+
+                top_pairs.append(
+                    f"{global_pos}:{value:.4f}"
+                )
+
+            print(
+                f"  head {head}: "
+                f"mean={mean_position:7.2f}  "
+                f"entropy={normalized_entropy:.3f}  "
+                f"past={past_mass:.3f}  "
+                f"here={current_mass:.3f}  "
+                f"future={future_mass:.3f}"
+            )
+
+            print(
+                "          "
+                f"±4={local_mass(4):.3f}  "
+                f"±8={local_mass(8):.3f}  "
+                f"±16={local_mass(16):.3f}  "
+                f"±32={local_mass(32):.3f}"
+            )
+
+            print(
+                "          top: "
+                + "  ".join(top_pairs)
+            )
+
+    def global_sampling(self, x1, x2, temperature=1.0, multiplier=1.0, sampling_func=None, diagnostic_steps=None, diagnostic_global_offset=0, diagnostic_prompt_length=0,):
         if not isinstance(multiplier, float):
             multiplier = torch.tensor(multiplier, dtype=torch.float32, device=x1.device)
             multiplier = multiplier[:, None, None]
         print('Yinyang Sampling')
+        if diagnostic_steps is None:
+            diagnostic_steps = set()
+        else:
+            diagnostic_steps = {
+                int(x)
+                for x in diagnostic_steps
+            }
         batch_size, max_seq_len, subseq_len = x1.shape
         indices1 = torch.arange(max_seq_len, dtype=torch.long, device=x1.device) * self.compress_ratio_l
         max_seq_len = max_seq_len * self.compress_ratio_l // self.compress_ratio_r
@@ -121,13 +528,92 @@ class RoformerYinyang(RoformerFineTune):
             data2 = next(gen2); assert data2[0] == Tags.PE_POSITIONS
             for layer in range(self.n_layers):
                 data2 = next(gen2); assert data2[0] == Tags.HIDDEN_STATES
+                # if layer % self.n_skip == 0:
+                #     h = data2[1]
+                #     indices2_slice = indices2[i + 1 - h.shape[1]:i + 1]
+                #     yinyang_weights = self.get_yinyang_attn(layer // self.n_skip)(h, gen1_hidden_states[layer], gen1_hidden_states[layer], None, indices_key=indices1, indices_query=indices2_slice)
+                # data2 = next(gen2); assert data2[0] == Tags.PRENORM_OUTPUT
+                # if layer % self.n_skip == 0:
+                #     data2[1] = data2[1] + yinyang_weights * multiplier
                 if layer % self.n_skip == 0:
                     h = data2[1]
-                    indices2_slice = indices2[i + 1 - h.shape[1]:i + 1]
-                    yinyang_weights = self.get_yinyang_attn(layer // self.n_skip)(h, gen1_hidden_states[layer], gen1_hidden_states[layer], None, indices_key=indices1, indices_query=indices2_slice)
-                data2 = next(gen2); assert data2[0] == Tags.PRENORM_OUTPUT
+
+                    indices2_slice = indices2[
+                        i + 1 - h.shape[1]:
+                        i + 1
+                    ]
+
+                    adapter_index = (
+                        layer // self.n_skip
+                    )
+
+                    attn_module = (
+                        self.get_yinyang_attn(
+                            adapter_index
+                        )
+                    )
+
+                    yinyang_weights = (
+                        attn_module(
+                            h,
+                            gen1_hidden_states[layer],
+                            gen1_hidden_states[layer],
+                            None,
+                            indices_key=indices1,
+                            indices_query=indices2_slice,
+                        )
+                    )
+
+                data2 = next(gen2)
+                assert (
+                    data2[0]
+                    == Tags.PRENORM_OUTPUT
+                )
+
                 if layer % self.n_skip == 0:
-                    data2[1] = data2[1] + yinyang_weights * multiplier
+                    model_global_step = (
+                        int(
+                            diagnostic_global_offset
+                        )
+                        + int(i)
+                    )
+
+                    if (
+                        model_global_step
+                        in diagnostic_steps
+                    ):
+                        harmonic_step = (
+                            model_global_step
+                            - int(
+                                diagnostic_prompt_length
+                            )
+                        )
+
+                        self._print_yinyang_diagnostic(
+                            attn_module=attn_module,
+                            adapter_index=adapter_index,
+                            model_global_step=(
+                                model_global_step
+                            ),
+                            harmonic_step=(
+                                harmonic_step
+                            ),
+                            melody_global_offset=(
+                                diagnostic_global_offset
+                            ),
+                            base_state=data2[1],
+                            yinyang_state=(
+                                yinyang_weights
+                            ),
+                            multiplier=multiplier,
+                            sample_index=0,
+                        )
+
+                    data2[1] = (
+                        data2[1]
+                        + yinyang_weights
+                        * multiplier
+                    )
         return end_generator(gen2)
 
     def loss(self, x, pitch_shift):
